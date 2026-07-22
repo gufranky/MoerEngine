@@ -1,8 +1,8 @@
 # MoerEngine 体积雾两周实现计划
 
-> 计划周期：2 周（10 个工作日，单人）  
-> 目标平台：Windows 11 / Vulkan / RTX 4060 Laptop GPU  
-> 目标分支：基于当前 `main` 分支  
+> 计划周期：2 周（10 个工作日，单人）
+> 目标平台：Windows 11 / Vulkan / RTX 4060 Laptop GPU
+> 目标分支：基于当前 `main` 分支
 > 目标：参考 Unreal Engine 的核心体积雾方法，在 MoerEngine 光栅化渲染器中实现可交互、可调参、具有体积阴影和时域稳定性的 Froxel 体积雾，并预留至少 3 个工作日用于性能和观感调优。
 
 ## 1. 目标与范围
@@ -540,4 +540,15 @@ UE 官方性能数据仅用于方法参考，不直接作为横向成绩，因�
 - `TemporalReprojection.hlsl`、`CompositeVolumetricFog.hlsl` 与 `DebugVisualize.hlsl` 均通过 DXC Vulkan 1.3 SPIR-V 独立编译；共享结构全量干净构建和 SSR 顺序增量构建均通过；
 - 运行日志确认 `history_weight=0.900`、`motion_response=0.350`、`clamp_expansion=0.100`，无 Shader、资源绑定、Vulkan 设备或 NaN 错误；Sponza 同时启用体积雾与 SSR 时编辑器显示整帧约 31 ms，该数字仅用于烟雾测试，不作为 GPU Pass 预算结论；
 - 当前限制：邻域 Clamp 每 Froxel 读取 27 个当前帧样本，正确性优先但带宽成本偏高；Day 7 需要用组共享内存、十字/分离邻域或低成本统计近似优化，并单独测量 GPU Scope。Computer Use 的离散按键不能形成持续高速旋转，本日验证覆盖静止、开关 A/B、越界和 SSR 顺序，高速旋转拖影仍需人工长按/鼠标操作补充压力测试；
-- 显存风险保持不变：Froxel 历史约 29.88 MiB，加全分辨率 HDR 合成总计约 45.70 MiB；新增调试切片只有约 28 KiB，不改变 Day 7 必须回收显存的结论。
+- Day 6 的初步统计只计入 29.88 MiB Froxel 与 15.82 MiB HDR 合成纹理，遗漏了全分辨率 RGBA16F 调试图；按实际新增分配复核约为 61.52 MiB。Day 7 必须复用合成 Scratch 并降低仅供观察的调试资源规格。
+
+### 2026-07-22：Day 7 第一阶段性能与资源优化
+
+- 历史邻域 Clamp 从完整 `3×3×3` 的 27 Tap 改为中心点加 XYZ 六轴邻居的 7 Tap，当前帧邻域纹理读取减少约 74%；DXC Vulkan 1.3 SPIR-V 体积由约 18.3 KiB 降至 12.2 KiB；
+- 审计确认 `upsample_output` 在现有 Raster 后处理链中没有生产者或消费者，将其增加 UAV 用途并作为体积雾 HDR 合成 Scratch，删除独占的全分辨率 `volumetric_fog_output`，节省 15.82 MiB；
+- `volumetric_fog_debug` 改为半分辨率 RGBA8。调试图属于 LDR 切片/热力图，不需要 RGBA16F；1080p 下由 15.82 MiB 降至约 1.98 MiB；
+- Medium 1080p 的实际体积雾自有资源现在为 29.88 MiB Froxel + 约 0.03 MiB History Weight 切片 + 1.98 MiB 调试图，共 31.89 MiB，回到 32 MiB 目标内；复用的 `upsample_output` 属于引擎既有 Scratch，不重复计入；
+- 全量干净构建 911 步通过；运行日志确认 `owned_memory_with_half_res_debug=31.89 MiB`，半分辨率 Incident Scattering 与 History Weight 调试输出均可正常铺满视口；
+- 为避免默认一开启就是开发期白雾，基线参数改为 `Base Density=0.006`、`Height Falloff=0.12`、`Ambient Intensity=0.25`、`Scattering Intensity=0.75`、`Directional Intensity=0.50`、`Fog Max Distance=60m`。滑块范围不变，后续 UE 对齐仍以固定机位实测为准；
+- 同一 Sponza 启动镜头的编辑器整帧粗测约为：关闭雾 27.4 ms、开启雾 30.8 ms。约 3.4 ms 差值包含调度波动与整条渲染链，只作为烟雾测试，不能代替 GPU Scope 的逐 Pass 结论；
+- 后续仍需用 GPU Scope 获取 27 Tap/7 Tap 的实际毫秒差，并针对相机连续旋转验证六轴 Clamp 是否需要更大的 Expansion 或质量档位切换。

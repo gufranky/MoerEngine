@@ -26,18 +26,12 @@ namespace Moer::Render::Raster {
       TexConfig::Default(PF_R16G16B16A16_SFLOAT)                                                                \
           .Usage(E_SAMPLED_COLOR | ETextureUsageFlags::UNORDERED_ACCESS))                                       \
     X(TexHandle, denoiser_output, Tex2DTag, TexConfig::Default(PF_R16G16B16A16_SFLOAT).Usage(E_SAMPLED_COLOR))  \
-    X(TexHandle, upsample_output, Tex2DTag, TexConfig::Default(PF_R16G16B16A16_SFLOAT).Usage(E_SAMPLED_COLOR))  \
+    X(TexHandle,                                                                                                \
+      upsample_output,                                                                                          \
+      Tex2DTag,                                                                                                 \
+      TexConfig::Default(PF_R16G16B16A16_SFLOAT)                                                               \
+          .Usage(E_SAMPLED_COLOR | ETextureUsageFlags::UNORDERED_ACCESS))                                       \
     X(TexHandle, ssr_output, Tex2DTag, TexConfig::Default(PF_R16G16B16A16_SFLOAT).Usage(E_SAMPLED_COLOR))       \
-    X(TexHandle,                                                                                                \
-      volumetric_fog_debug,                                                                                     \
-      Tex2DTag,                                                                                                 \
-      TexConfig::Default(PF_R16G16B16A16_SFLOAT)                                                               \
-          .Usage(ETextureUsageFlags::SAMPLED | ETextureUsageFlags::UNORDERED_ACCESS))                           \
-    X(TexHandle,                                                                                                \
-      volumetric_fog_output,                                                                                    \
-      Tex2DTag,                                                                                                 \
-      TexConfig::Default(PF_R16G16B16A16_SFLOAT)                                                               \
-          .Usage(ETextureUsageFlags::SAMPLED | ETextureUsageFlags::UNORDERED_ACCESS))                           \
     X(TexHandle, aa_texture_1, Tex2DTag, TexConfig::Default(PF_R16G16B16A16_SFLOAT).Usage(E_SAMPLED_COLOR))     \
     X(TexHandle, aa_texture_2, Tex2DTag, TexConfig::Default(PF_R16G16B16A16_SFLOAT).Usage(E_SAMPLED_COLOR))     \
     X(TexHandle, aa_texture_3, Tex2DTag, TexConfig::Default(PF_R16G16B16A16_SFLOAT).Usage(E_SAMPLED_COLOR))     \
@@ -138,6 +132,9 @@ struct RasterTextures {
     RASTER_TEXTURES_TABLE_DOWNSAMPLED
 #undef X
 
+    // Development visualization only: half resolution and LDR are sufficient for slice/heatmap views.
+    TextureWithHandle volumetric_fog_debug;
+
     // Auto-generated half-resolution variants for downsampled textures
 #define X(TYPE, NAME, TEXTYPE, CONFIG) TYPE NAME##_half;
     RASTER_TEXTURES_TABLE_DOWNSAMPLED
@@ -177,6 +174,17 @@ struct RasterTextures {
         RASTER_TEXTURES_TABLE
         RASTER_TEXTURES_TABLE_DOWNSAMPLED
 #undef X
+
+        {
+            const uint2 debug_size = uint2(std::max(1u, size.x / 2u), std::max(1u, size.y / 2u));
+            TexConfig debug_cfg = TexConfig::Default(PF_R8G8B8A8_UNORM)
+                                      .Usage(ETextureUsageFlags::SAMPLED |
+                                             ETextureUsageFlags::UNORDERED_ACCESS)
+                                      .SamplerConfig(SF_LINEAR, SAM_CLAMP_TO_EDGE);
+            AssetTool::CreateRasterResource<Tex2DTag>(
+                volumetric_fog_debug, device, "volumetric_fog_debug", debug_size, debug_cfg
+            );
+        }
 
         // Half-resolution variants
         {
@@ -220,6 +228,12 @@ struct RasterTextures {
         RASTER_TEXTURES_TABLE_DOWNSAMPLED
 #undef X
 
+        {
+            TexConfig debug_cfg;
+            debug_cfg.sampler = {ESamplerFilter::SF_LINEAR, ESamplerAddressMode::SAM_CLAMP_TO_EDGE};
+            AssetTool::AllocateRasterResourceHandle(bindless_array, volumetric_fog_debug, debug_cfg);
+        }
+
         // Half-resolution variants (LINEAR sampler for bilinear upsampling)
 #define X(TYPE, NAME, TEXTYPE, CONFIG)                                                         \
     {                                                                                          \
@@ -251,6 +265,8 @@ struct RasterTextures {
         RASTER_TEXTURES_TABLE_DOWNSAMPLED
 #undef X
 
+        AssetTool::FreeRasterResourceHandle(bindless_array, volumetric_fog_debug);
+
         // Half-resolution variants
 #define X(TYPE, NAME, TEXTYPE, CONFIG) \
     AssetTool::FreeRasterResourceHandle(bindless_array, NAME##_half);
@@ -269,6 +285,8 @@ struct RasterTextures {
         RASTER_TEXTURES_TABLE
         RASTER_TEXTURES_TABLE_DOWNSAMPLED
 #undef X
+        assert(volumetric_fog_debug.tex != nullptr && "There is an empty volumetric fog debug buffer!");
+        views.emplace_back(volumetric_fog_debug.tex->GetView());
         // 去除 output
         bool b_has_erased = false;
         for (auto it = views.begin(); it != views.end(); ++it) {

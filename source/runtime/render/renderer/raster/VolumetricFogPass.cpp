@@ -105,12 +105,18 @@ void VolumetricFogPass::RecreateResources(RasterContext& context) {
 
     LOG_INFO(
         "[VolumetricFog] Created Froxel resources: {}x{}x{} (tile={}, medium=RGBA16F, shadow=R16F, "
-        "integrated=RGBA16F, history=2xRGBA16F, froxel_memory={:.2f} MiB).",
+        "integrated=RGBA16F, history=2xRGBA16F, froxel_memory={:.2f} MiB, "
+        "owned_memory_with_half_res_debug={:.2f} MiB, composite_scratch=upsample_output).",
         froxel_x,
         froxel_y,
         k_froxel_depth,
         k_froxel_tile_size,
-        static_cast<double>(froxel_x) * froxel_y * k_froxel_depth * 34.0 / (1024.0 * 1024.0)
+        static_cast<double>(froxel_x) * froxel_y * k_froxel_depth * 34.0 / (1024.0 * 1024.0),
+        (static_cast<double>(froxel_x) * froxel_y * k_froxel_depth * 34.0 +
+         static_cast<double>(froxel_x) * froxel_y * 2.0 +
+         static_cast<double>(context.textures.volumetric_fog_debug.GetSize().x) *
+             context.textures.volumetric_fog_debug.GetSize().y * 4.0) /
+            (1024.0 * 1024.0)
     );
 
     temporal_history_valid = false;
@@ -426,7 +432,9 @@ TextureWithHandle VolumetricFogPass::Composite(
     param.far_clip          = camera.GetFarClip();
     param.max_distance      = std::min(config.volumetric_fog_max_distance, camera.GetFarClip());
     param.volume_depth      = resource.froxel_size.z;
-    param.output_resolution = uint2(context.textures.volumetric_fog_output.GetSize());
+    // upsample_output is otherwise unused at this point in the raster post-process chain.
+    // Reusing it avoids another full-resolution RGBA16F allocation dedicated to fog.
+    param.output_resolution = uint2(context.textures.upsample_output.GetSize());
 
     context.cmd_list.PushScopeWithTimeScope("Volumetric Fog Day6 Trilinear HDR Composite");
     context.cmd_list.Compute(
@@ -435,7 +443,7 @@ TextureWithHandle VolumetricFogPass::Composite(
         input_image.tex,
         context.textures.depth_nearest_sampler.tex->GetView(),
         resource.integrated_volume->GetView(),
-        context.textures.volumetric_fog_output.tex
+        context.textures.upsample_output.tex
     ).Dispatch(
         uint3((param.output_resolution.x + 7u) / 8u, (param.output_resolution.y + 7u) / 8u, 1u),
         "Volumetric Fog Depth-Aware HDR Composite"
@@ -454,7 +462,7 @@ TextureWithHandle VolumetricFogPass::Composite(
         day4_composite_was_enabled = true;
     }
 
-    return context.textures.volumetric_fog_output;
+    return context.textures.upsample_output;
 }
 
 } // namespace Moer::Render::Raster

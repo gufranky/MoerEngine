@@ -1,5 +1,5 @@
-// Day-5 MVP: reproject the previous view-aligned froxel medium into the current grid and
-// blend it with the jittered current-frame lighting result. Invalid history falls back to current.
+// Reproject the previous view-aligned froxel medium into the current grid and blend it with
+// the jittered current-frame result. Day 7 uses a 7-tap axis cross for a lower-bandwidth clamp.
 
 #include "core/common/Common.hlsl"
 #include "shared/raster/ShaderParameters.h"
@@ -57,20 +57,19 @@ void current_neighborhood_bounds(
     neighborhood_min = current_volume.Load(int4(coordinate, 0));
     neighborhood_max = neighborhood_min;
     const int3 max_coordinate = int3(dimensions) - 1;
+    static const int3 offsets[6] = {
+        int3(-1, 0, 0), int3(1, 0, 0),
+        int3(0, -1, 0), int3(0, 1, 0),
+        int3(0, 0, -1), int3(0, 0, 1)
+    };
     [unroll]
-    for (int z = -1; z <= 1; ++z) {
-        [unroll]
-        for (int y = -1; y <= 1; ++y) {
-            [unroll]
-            for (int x = -1; x <= 1; ++x) {
-                const int3 sample_coordinate = clamp(
-                    int3(coordinate) + int3(x, y, z), int3(0, 0, 0), max_coordinate
-                );
-                const float4 sample_medium = current_volume.Load(int4(sample_coordinate, 0));
-                neighborhood_min = min(neighborhood_min, sample_medium);
-                neighborhood_max = max(neighborhood_max, sample_medium);
-            }
-        }
+    for (uint sample_index = 0u; sample_index < 6u; ++sample_index) {
+        const int3 sample_coordinate = clamp(
+            int3(coordinate) + offsets[sample_index], int3(0, 0, 0), max_coordinate
+        );
+        const float4 sample_medium = current_volume.Load(int4(sample_coordinate, 0));
+        neighborhood_min = min(neighborhood_min, sample_medium);
+        neighborhood_max = max(neighborhood_max, sample_medium);
     }
 }
 
