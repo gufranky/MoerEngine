@@ -361,8 +361,10 @@ struct RasterConfig {
     float  volumetric_fog_shadow_bias           = 0.0005f;
     bool   volumetric_fog_temporal_enabled       = true;
     bool   volumetric_fog_jitter_enabled         = true;
-    float  volumetric_fog_history_weight         = 0.90f;
-    float  volumetric_fog_history_motion_scale   = 0.35f;
+    // Favor stability for a world-space medium. Neighborhood clamping still rejects stale
+    // history, while a gentler motion response avoids exposing stochastic CSM edges on motion.
+    float  volumetric_fog_history_weight         = 0.94f;
+    float  volumetric_fog_history_motion_scale   = 0.15f;
     float  volumetric_fog_history_clamp_expansion = 0.10f;
     float  volumetric_fog_history_reset_distance = 2.0f;
     float  volumetric_fog_history_reset_angle    = 20.0f;

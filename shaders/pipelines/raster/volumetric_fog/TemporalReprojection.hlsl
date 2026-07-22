@@ -157,9 +157,32 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID) {
     const float3 expected_jitter_motion = param.current_jitter - param.previous_jitter;
     const float3 reprojection_motion =
         previous_coordinate - float3(dispatch_thread_id) - expected_jitter_motion;
-    const float applied_history_weight = saturate(param.history_weight) * exp(
-        -length(reprojection_motion) * max(param.motion_weight_scale, 0.0)
+    // Stochastic froxel and shadow samples have the most visible variance at a high-contrast
+    // lighting boundary. Do not throw their valid world-space history away just because the
+    // camera moved across the froxel grid: that exposes a different jitter sample every frame
+    // and presents as a shimmering edge. The neighborhood clamp above remains the guard against
+    // stale history, while smooth regions keep the configured motion response.
+    const float3 rgb_range = neighborhood_range.rgb;
+    const float rgb_reference = max(
+        max(max(neighborhood_max.r, neighborhood_max.g), neighborhood_max.b), 1.0e-3
     );
+    const float normalized_rgb_range = max(max(rgb_range.r, rgb_range.g), rgb_range.b) /
+        rgb_reference;
+    const float normalized_extinction_range = neighborhood_range.a /
+        max(neighborhood_max.a, 1.0e-3);
+    const float edge_confidence = saturate(
+        max(normalized_rgb_range, normalized_extinction_range) * 1.5
+    );
+
+    const float base_history_weight = saturate(param.history_weight);
+    const float edge_history_weight = min(base_history_weight + 0.04, 0.98);
+    const float motion_response = max(param.motion_weight_scale, 0.0) *
+        lerp(1.0, 0.35, edge_confidence);
+    const float applied_history_weight = lerp(
+        base_history_weight,
+        edge_history_weight,
+        edge_confidence
+    ) * exp(-length(reprojection_motion) * motion_response);
     const float4 temporal_medium = lerp(
         current_medium,
         max(history_medium, 0.0),
