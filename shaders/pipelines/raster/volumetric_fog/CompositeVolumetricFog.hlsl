@@ -32,10 +32,41 @@ float4 load_integrated_boundary(uint2 volume_xy, float boundary_position) {
     return lerp(lower_value, upper_value, interpolation);
 }
 
-float4 load_integrated_trilinear(
+float scene_view_depth_at(uint2 pixel) {
+    const float raw_depth = scene_depth.Load(int3(pixel, 0));
+    return raw_depth <= 1.0e-6 ? param.max_distance : linearize_reverse_z(raw_depth);
+}
+
+uint2 froxel_center_pixel(uint2 volume_xy, uint2 volume_dimensions) {
+    const float2 pixel_position =
+        (float2(volume_xy) + 0.5) * float2(param.output_resolution) /
+        float2(volume_dimensions) - 0.5;
+    return uint2(clamp(
+        round(pixel_position), 0.0, float2(param.output_resolution - 1u)
+    ));
+}
+
+float geometry_depth_weight(
+    float center_view_depth,
+    uint2 volume_xy,
+    uint2 volume_dimensions
+) {
+    const float neighbor_view_depth = scene_view_depth_at(
+        froxel_center_pixel(volume_xy, volume_dimensions)
+    );
+
+    // Keep interpolation smooth on the same plane, but reject columns whose representative
+    // geometry belongs to another depth layer. The absolute floor prevents over-rejection near
+    // the camera, while the relative term scales with perspective distance.
+    const float depth_sigma = max(0.25, min(center_view_depth, neighbor_view_depth) * 0.04);
+    return exp(-abs(neighbor_view_depth - center_view_depth) / depth_sigma);
+}
+
+float4 load_integrated_depth_aware(
     float2 volume_position,
     float boundary_position,
-    uint2 volume_dimensions
+    uint2 volume_dimensions,
+    float center_view_depth
 ) {
     const float2 clamped_position = clamp(
         volume_position, 0.0, float2(volume_dimensions - 1u)
@@ -44,17 +75,40 @@ float4 load_integrated_trilinear(
     const uint2 upper_xy = min(lower_xy + 1u, volume_dimensions - 1u);
     const float2 interpolation = frac(clamped_position);
 
-    const float4 lower_x = lerp(
-        load_integrated_boundary(lower_xy, boundary_position),
-        load_integrated_boundary(uint2(upper_xy.x, lower_xy.y), boundary_position),
-        interpolation.x
-    );
-    const float4 upper_x = lerp(
-        load_integrated_boundary(uint2(lower_xy.x, upper_xy.y), boundary_position),
-        load_integrated_boundary(upper_xy, boundary_position),
-        interpolation.x
-    );
-    return lerp(lower_x, upper_x, interpolation.y);
+    const uint2 sample_coordinates[4] = {
+        lower_xy,
+        uint2(upper_xy.x, lower_xy.y),
+        uint2(lower_xy.x, upper_xy.y),
+        upper_xy
+    };
+    const float bilinear_weights[4] = {
+        (1.0 - interpolation.x) * (1.0 - interpolation.y),
+        interpolation.x * (1.0 - interpolation.y),
+        (1.0 - interpolation.x) * interpolation.y,
+        interpolation.x * interpolation.y
+    };
+
+    float4 weighted_fog = 0.0;
+    float total_weight = 0.0;
+    [unroll]
+    for (uint sample_index = 0u; sample_index < 4u; ++sample_index) {
+        const float weight = bilinear_weights[sample_index] * geometry_depth_weight(
+            center_view_depth, sample_coordinates[sample_index], volume_dimensions
+        );
+        weighted_fog += load_integrated_boundary(
+            sample_coordinates[sample_index], boundary_position
+        ) * weight;
+        total_weight += weight;
+    }
+
+    if (total_weight > 1.0e-5) {
+        return weighted_fog / total_weight;
+    }
+
+    // All four representatives can disagree at a very thin silhouette. Use the nearest column
+    // instead of allowing background fog to bleed across the geometry edge.
+    const uint2 nearest_xy = uint2(round(clamped_position));
+    return load_integrated_boundary(nearest_xy, boundary_position);
 }
 
 [numthreads(8, 8, 1)]
@@ -73,17 +127,17 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID) {
         (float2(pixel) + 0.5) * float2(volume_width, volume_height) /
         float2(param.output_resolution) - 0.5;
 
-    const float raw_depth = scene_depth.Load(int3(pixel, 0));
-    const float scene_view_depth = raw_depth <= 1.0e-6
-        ? param.max_distance
-        : linearize_reverse_z(raw_depth);
+    const float scene_view_depth = scene_view_depth_at(pixel);
     const float target_view_depth = clamp(scene_view_depth, param.near_clip, param.max_distance);
     const float log_range = log(max(param.max_distance / max(param.near_clip, 1.0e-3), 1.0001));
     const float boundary_position =
         log(max(target_view_depth, param.near_clip) / max(param.near_clip, 1.0e-3)) / log_range
         * float(param.volume_depth);
-    const float4 fog = load_integrated_trilinear(
-        volume_position, boundary_position, uint2(volume_width, volume_height)
+    const float4 fog = load_integrated_depth_aware(
+        volume_position,
+        boundary_position,
+        uint2(volume_width, volume_height),
+        target_view_depth
     );
     const float4 color = scene_color.Load(int3(pixel, 0));
 

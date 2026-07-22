@@ -552,3 +552,4 @@ UE 官方性能数据仅用于方法参考，不直接作为横向成绩，因�
 - 为避免默认一开启就是开发期白雾，基线参数改为 `Base Density=0.006`、`Height Falloff=0.12`、`Ambient Intensity=0.25`、`Scattering Intensity=0.75`、`Directional Intensity=0.50`、`Fog Max Distance=60m`。滑块范围不变，后续 UE 对齐仍以固定机位实测为准；
 - 同一 Sponza 启动镜头的编辑器整帧粗测约为：关闭雾 27.4 ms、开启雾 30.8 ms。约 3.4 ms 差值包含调度波动与整条渲染链，只作为烟雾测试，不能代替 GPU Scope 的逐 Pass 结论；
 - 后续仍需用 GPU Scope 获取 27 Tap/7 Tap 的实际毫秒差，并针对相机连续旋转验证六轴 Clamp 是否需要更大的 Expansion 或质量档位切换。
+- 用户复测仍能观察到明显体积雾轮廓。代码审计确认 Day 6 的 XY 双线性只考虑屏幕距离，未比较四个 Froxel 代表像素的场景深度；在前景/背景深度断层处会把背景雾混入物体轮廓。现增加深度引导权重：同深度层保持双线性，深度差异按相对距离指数衰减，极薄轮廓四邻域均失配时回退到最近 Froxel；不增加纹理或显存。
