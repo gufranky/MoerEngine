@@ -90,8 +90,11 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID) {
         return;
     }
 
+    // The history texture is a cell-average estimate on a stable, unjittered froxel grid.
+    // Jitter only chooses the current frame's stochastic injection sample inside that cell;
+    // it must not move the accumulated history grid itself.
     const float2 current_uv =
-        (float2(dispatch_thread_id.xy) + 0.5 + param.current_jitter.xy) / float2(width, height);
+        (float2(dispatch_thread_id.xy) + 0.5) / float2(width, height);
     const float3 far_world = world_pos_from_depth(0.0, current_uv, param.clip2world);
     const float3 ray_world = normalize(far_world - param.camera_position);
     const float3 ray_view = mul(param.world2view, float4(ray_world, 0.0)).xyz;
@@ -99,7 +102,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID) {
     const float near_distance = max(param.near_clip, 1.0e-3);
     const float far_distance = max(min(param.max_distance, param.far_clip), near_distance + 1.0e-3);
     const float current_slice_fraction = saturate(
-        (float(dispatch_thread_id.z) + 0.5 + param.current_jitter.z) / float(depth)
+        (float(dispatch_thread_id.z) + 0.5) / float(depth)
     );
     const float current_view_depth =
         near_distance * pow(far_distance / near_distance, current_slice_fraction);
@@ -125,8 +128,8 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID) {
         log(far_distance / near_distance);
 
     const float3 previous_coordinate = float3(
-        previous_uv * float2(width, height) - 0.5 - param.previous_jitter.xy,
-        previous_slice_fraction * float(depth) - 0.5 - param.previous_jitter.z
+        previous_uv * float2(width, height) - 0.5,
+        previous_slice_fraction * float(depth) - 0.5
     );
     const float3 max_coordinate = float3(dimensions - 1u);
     const bool history_inside =
@@ -152,11 +155,11 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID) {
         neighborhood_max + clamp_margin
     );
 
-    // Remove the expected Halton offset change so only actual camera/grid motion makes
-    // the history more responsive.
-    const float3 expected_jitter_motion = param.current_jitter - param.previous_jitter;
+    // Jitter does not participate in history-grid motion. A static camera therefore maps an
+    // accumulated cell exactly back to itself instead of resampling the whole history volume
+    // by the Halton delta every frame.
     const float3 reprojection_motion =
-        previous_coordinate - float3(dispatch_thread_id) - expected_jitter_motion;
+        previous_coordinate - float3(dispatch_thread_id);
     // Stochastic froxel and shadow samples have the most visible variance at a high-contrast
     // lighting boundary. Do not throw their valid world-space history away just because the
     // camera moved across the froxel grid: that exposes a different jitter sample every frame

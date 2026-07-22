@@ -88,24 +88,44 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID) {
         return;
     }
 
-    const float2 uv =
+    const float2 jittered_uv =
         (float2(dispatch_thread_id.xy) + 0.5 + param.jitter.xy) / float2(width, height);
+    const float2 stable_uv =
+        (float2(dispatch_thread_id.xy) + 0.5) / float2(width, height);
 
     // Moer uses reversed Z: device depth 0 is the far plane. The normalized ray is then
     // scaled so the exponentially distributed slice depth is measured along view-space Z,
     // matching a perspective frustum rather than a spherical shell around the camera.
-    const float3 far_world = world_pos_from_depth(0.0, uv, param.clip2world);
+    const float3 far_world = world_pos_from_depth(0.0, jittered_uv, param.clip2world);
     const float3 ray_world = normalize(far_world - param.camera_position);
     const float3 ray_view  = mul(param.world2view, float4(ray_world, 0.0)).xyz;
+
+    // Keep discontinuous lighting queries on the stable froxel center. Sampling CSM at the
+    // jittered density position makes the binary depth comparisons cross a shadow edge every
+    // frame; even after temporal accumulation this presents as a shimmering light-shaft edge.
+    // Density remains stochastic below so temporal supersampling still hides slice banding.
+    const float3 stable_far_world = world_pos_from_depth(0.0, stable_uv, param.clip2world);
+    const float3 stable_ray_world = normalize(stable_far_world - param.camera_position);
+    const float3 stable_ray_view = mul(
+        param.world2view, float4(stable_ray_world, 0.0)
+    ).xyz;
 
     const float slice_fraction = saturate(
         (float(dispatch_thread_id.z) + 0.5 + param.jitter.z) / float(depth)
     );
+    const float stable_slice_fraction =
+        (float(dispatch_thread_id.z) + 0.5) / float(depth);
     const float near_distance  = max(param.near_clip, 1.0e-3);
     const float far_distance   = max(min(param.max_distance, param.far_clip), near_distance + 1.0e-3);
     const float view_depth     = near_distance * pow(far_distance / near_distance, slice_fraction);
     const float ray_distance   = view_depth / max(abs(ray_view.z), 1.0e-4);
     const float3 world_position = param.camera_position + ray_world * ray_distance;
+    const float stable_view_depth = near_distance * pow(
+        far_distance / near_distance, stable_slice_fraction
+    );
+    const float stable_ray_distance = stable_view_depth / max(abs(stable_ray_view.z), 1.0e-4);
+    const float3 stable_world_position =
+        param.camera_position + stable_ray_world * stable_ray_distance;
 
     // Density is specified at height_offset and decays upward. Clamp the exponent to keep
     // FP16 storage stable when the camera moves far below the reference height.
@@ -118,8 +138,10 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID) {
     const float3 scattering = extinction * saturate(param.albedo) * max(param.ambient_color, 0.0)
         * max(param.ambient_intensity, 0.0);
 
-    const float visibility = sample_csm_visibility(world_position);
-    const float cos_theta = dot(normalize(param.directional_light_direction), -ray_world);
+    const float visibility = sample_csm_visibility(stable_world_position);
+    const float cos_theta = dot(
+        normalize(param.directional_light_direction), -stable_ray_world
+    );
     const float phase = henyey_greenstein(cos_theta, param.phase_g);
     const float3 directional_scattering = extinction * saturate(param.albedo)
         * max(param.directional_light_color, 0.0) * max(param.directional_intensity, 0.0)
