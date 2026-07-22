@@ -19,6 +19,7 @@
 #include "SkyboxPass.h"
 #include "SsrPass.h"
 #include "TonemappingPass.h"
+#include "VolumetricFogPass.h"
 #include "debug/RenderDocApi.h"
 #include "misc/ScopedLogTimer.h"
 #include "scene/testcase/SceneTestCaseDispatcher.h"
@@ -79,6 +80,7 @@ RasterRenderer::RasterRenderer(
     rtao_denoiser_pass           = MakeUnique<RtaoDenoiserPass>(raster_context);
     bfd_pass                     = MakeUnique<BilateralFilterDenoiserPass>(raster_context);
     ssr_pass                     = MakeUnique<SsrPass>(raster_context);
+    volumetric_fog_pass          = MakeUnique<VolumetricFogPass>(raster_context);
     cooperative_ops_pass         = MakeUnique<CooperativeOpsPass>(raster_context);
     aa_pass                      = MakeUnique<AaPass>(raster_context);
     bloom_pass                   = MakeUnique<BloomPass>(raster_context);
@@ -289,6 +291,7 @@ bool RasterRenderer::RunSingle(const SharedPtr<EditorConfig> editor_config, cons
 
         raster_context.FreeFrameBuffers(false);
         raster_context.CreateFrameBuffers();
+        volumetric_fog_pass->RecreateResources(raster_context);
         // raster_context.UploadExternalFrameBuffers(); // 窗口大小变化时，外部纹理不会变化，所以不需要上传
         raster_context.AllocateFrameBuffers();
 
@@ -420,6 +423,10 @@ bool RasterRenderer::RunSingle(const SharedPtr<EditorConfig> editor_config, cons
 
         probe_gizmo_pass->Process(raster_context, raster_config, camera);
 
+        // Day-1 RHI validation and Day-2 view-aligned exponential-height medium.
+        volumetric_fog_pass->ProcessSmokeTest(raster_context, raster_config);
+        volumetric_fog_pass->Process(raster_context, raster_config, camera);
+
         // Post Process Passes
         // - Ambient Occlusion
         auto ao_result = ao_pass->Process(raster_context, raster_config, camera, time);
@@ -441,6 +448,10 @@ bool RasterRenderer::RunSingle(const SharedPtr<EditorConfig> editor_config, cons
 
         // - Screen Space Reflection
         processing_image = ssr_pass->Process(raster_context, raster_config, camera, processing_image);
+
+        // - Volumetric Fog: composite after opaque lighting/AO/SSR so reflected surfaces receive
+        //   the same camera-to-surface aerial perspective, and before AA/Bloom/Tonemapping.
+        processing_image = volumetric_fog_pass->Composite(raster_context, raster_config, camera, processing_image);
 
         // - Cooperative Ops
         processing_image = cooperative_ops_pass->Process(raster_context, raster_config, processing_image);

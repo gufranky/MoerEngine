@@ -29,6 +29,7 @@ __pycache__/
 
 # 5. Logs
 /logs/
+/saved/
 /log*.txt
 /*.log
 .VSCodeCounter/

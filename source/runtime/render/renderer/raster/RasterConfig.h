@@ -337,6 +337,37 @@ struct RasterConfig {
     float ssr_metallic_threshold         = 0.5;
     float ssr_step_base                  = 0.025;
 
+    // MARK: Volumetric Fog
+    // Day-1 development switch. This executes a 3D UAV write + SRV sample smoke test only.
+    bool volumetric_fog_smoke_test_enabled = false;
+
+    // Day-2 base medium. The volume stores ambient in-scattering (RGB) and extinction (A).
+    bool   volumetric_fog_enabled              = false;
+    float  volumetric_fog_base_density         = 0.025f;
+    float  volumetric_fog_height_falloff       = 0.18f;
+    float  volumetric_fog_height_offset        = 0.0f;
+    float  volumetric_fog_extinction_scale     = 1.0f;
+    float3 volumetric_fog_albedo               = float3(0.9f, 0.92f, 1.0f);
+    float3 volumetric_fog_ambient_color         = float3(0.48f, 0.62f, 0.95f);
+    float  volumetric_fog_ambient_intensity     = 1.0f;
+    float  volumetric_fog_scattering_intensity  = 1.0f;
+    float  volumetric_fog_max_distance          = 80.0f;
+    float  volumetric_fog_directional_intensity = 1.0f;
+    float  volumetric_fog_phase_g               = 0.2f;
+    bool   volumetric_fog_shadows_enabled       = true;
+    int    volumetric_fog_shadow_pcf_radius     = 1;
+    float  volumetric_fog_shadow_bias           = 0.0005f;
+    bool   volumetric_fog_temporal_enabled       = true;
+    bool   volumetric_fog_jitter_enabled         = true;
+    float  volumetric_fog_history_weight         = 0.90f;
+    float  volumetric_fog_history_motion_scale   = 0.35f;
+    float  volumetric_fog_history_clamp_expansion = 0.10f;
+    float  volumetric_fog_history_reset_distance = 2.0f;
+    float  volumetric_fog_history_reset_angle    = 20.0f;
+    int    volumetric_fog_debug_mode            = 0;
+    int    volumetric_fog_debug_slice           = 16;
+    float  volumetric_fog_debug_exposure        = 8.0f;
+
     // MARK: Bloom
     bool bloom_enabled = true;
 

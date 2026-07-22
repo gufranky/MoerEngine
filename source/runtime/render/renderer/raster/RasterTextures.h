@@ -28,6 +28,16 @@ namespace Moer::Render::Raster {
     X(TexHandle, denoiser_output, Tex2DTag, TexConfig::Default(PF_R16G16B16A16_SFLOAT).Usage(E_SAMPLED_COLOR))  \
     X(TexHandle, upsample_output, Tex2DTag, TexConfig::Default(PF_R16G16B16A16_SFLOAT).Usage(E_SAMPLED_COLOR))  \
     X(TexHandle, ssr_output, Tex2DTag, TexConfig::Default(PF_R16G16B16A16_SFLOAT).Usage(E_SAMPLED_COLOR))       \
+    X(TexHandle,                                                                                                \
+      volumetric_fog_debug,                                                                                     \
+      Tex2DTag,                                                                                                 \
+      TexConfig::Default(PF_R16G16B16A16_SFLOAT)                                                               \
+          .Usage(ETextureUsageFlags::SAMPLED | ETextureUsageFlags::UNORDERED_ACCESS))                           \
+    X(TexHandle,                                                                                                \
+      volumetric_fog_output,                                                                                    \
+      Tex2DTag,                                                                                                 \
+      TexConfig::Default(PF_R16G16B16A16_SFLOAT)                                                               \
+          .Usage(ETextureUsageFlags::SAMPLED | ETextureUsageFlags::UNORDERED_ACCESS))                           \
     X(TexHandle, aa_texture_1, Tex2DTag, TexConfig::Default(PF_R16G16B16A16_SFLOAT).Usage(E_SAMPLED_COLOR))     \
     X(TexHandle, aa_texture_2, Tex2DTag, TexConfig::Default(PF_R16G16B16A16_SFLOAT).Usage(E_SAMPLED_COLOR))     \
     X(TexHandle, aa_texture_3, Tex2DTag, TexConfig::Default(PF_R16G16B16A16_SFLOAT).Usage(E_SAMPLED_COLOR))     \

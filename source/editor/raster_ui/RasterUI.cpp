@@ -30,6 +30,24 @@ void RasterUI::ShowConfig() {
         return;
     }
 
+    // The framebuffer list is rebuilt when raster resources are recreated. Keep the UI selection
+    // defensive so a stale index (for example after adding a new debug target) cannot be
+    // dereferenced while opening the settings panel.
+    if (m_frame_buffer_and_name_array.empty()) {
+        ImGui::TextDisabled("No raster frame buffers are registered.");
+        ImGui::TreePop();
+        return;
+    }
+    if (m_config.selected_frame_buffer_index >= m_frame_buffer_and_name_array.size() ||
+        m_frame_buffer_and_name_array[m_config.selected_frame_buffer_index].GetTexture() == nullptr) {
+        LOG_WARNING(
+            "Raster UI reset invalid framebuffer selection: index={}, count={}.",
+            m_config.selected_frame_buffer_index,
+            m_frame_buffer_and_name_array.size()
+        );
+        m_config.selected_frame_buffer_index = GetDefaultSelectedFrameBufferIndex();
+    }
+
     auto draw_border = [&]() {
         // 获取选项的矩形区域
         ImVec2 min = ImGui::GetItemRectMin();
@@ -843,6 +861,85 @@ void RasterUI::ShowConfig() {
             ImGui::SliderFloat("Depth Bias", &m_config.ssdo_depth_bias, 0.0f, 0.1f);
         }
 
+        ImGui::TreePop();
+    }
+
+    // MARK: Volumetric Fog
+    if (ImGui::TreeNode(
+            "Volumetric Fog (Development)",
+            "Volumetric Fog: [%s]",
+            m_config.volumetric_fog_enabled ? "Enable" : "Disable"
+        )) {
+        ImGui::Checkbox("Enable Volumetric Fog", &m_config.volumetric_fog_enabled);
+        ImGui::SliderFloat("Base Density", &m_config.volumetric_fog_base_density, 0.0f, 0.25f, "%.4f");
+        ImGui::SliderFloat("Height Falloff", &m_config.volumetric_fog_height_falloff, 0.0f, 2.0f, "%.3f");
+        ImGui::SliderFloat("Height Offset", &m_config.volumetric_fog_height_offset, -20.0f, 20.0f, "%.2f");
+        ImGui::SliderFloat(
+            "Extinction Scale", &m_config.volumetric_fog_extinction_scale, 0.0f, 8.0f, "%.3f"
+        );
+        ImGui::ColorEdit3("Fog Albedo", (float*)&m_config.volumetric_fog_albedo);
+        ImGui::ColorEdit3("Ambient Light Color", (float*)&m_config.volumetric_fog_ambient_color);
+        ImGui::SliderFloat(
+            "Ambient Intensity", &m_config.volumetric_fog_ambient_intensity, 0.0f, 8.0f, "%.3f"
+        );
+        ImGui::SliderFloat(
+            "Scattering Intensity", &m_config.volumetric_fog_scattering_intensity, 0.0f, 8.0f, "%.3f"
+        );
+        ImGui::SliderFloat(
+            "Directional Intensity", &m_config.volumetric_fog_directional_intensity, 0.0f, 8.0f, "%.3f"
+        );
+        ImGui::SliderFloat("Phase Anisotropy (g)", &m_config.volumetric_fog_phase_g, -0.9f, 0.9f, "%.3f");
+        ImGui::Checkbox("Enable Volumetric CSM Shadows", &m_config.volumetric_fog_shadows_enabled);
+        ImGui::SliderInt("Volumetric Shadow PCF Radius", &m_config.volumetric_fog_shadow_pcf_radius, 0, 2);
+        ImGui::SliderFloat(
+            "Volumetric Shadow Bias", &m_config.volumetric_fog_shadow_bias, 0.0f, 0.01f, "%.5f"
+        );
+        ImGui::SliderFloat(
+            "Fog Max Distance", &m_config.volumetric_fog_max_distance, 1.0f, 500.0f, "%.1f"
+        );
+
+        ImGui::SeparatorText("Temporal Reprojection");
+        ImGui::Checkbox("Enable Temporal Reprojection", &m_config.volumetric_fog_temporal_enabled);
+        ImGui::Checkbox("Enable Froxel Jitter", &m_config.volumetric_fog_jitter_enabled);
+        ImGui::SliderFloat(
+            "History Weight", &m_config.volumetric_fog_history_weight, 0.0f, 0.99f, "%.3f"
+        );
+        ImGui::SliderFloat(
+            "History Motion Response", &m_config.volumetric_fog_history_motion_scale, 0.0f, 2.0f, "%.3f"
+        );
+        ImGui::SliderFloat(
+            "History Clamp Expansion", &m_config.volumetric_fog_history_clamp_expansion, 0.0f, 1.0f, "%.3f"
+        );
+        ImGui::SliderFloat(
+            "History Reset Distance", &m_config.volumetric_fog_history_reset_distance, 0.1f, 20.0f, "%.2f"
+        );
+        ImGui::SliderFloat(
+            "History Reset Angle", &m_config.volumetric_fog_history_reset_angle, 1.0f, 90.0f, "%.1f deg"
+        );
+
+        static const char* debug_modes[] = {
+            "Incident Scattering",
+            "Density",
+            "Extinction",
+            "CSM Shadow Visibility",
+            "Integrated Scattering",
+            "Transmittance",
+            "History Weight"
+        };
+        ImGui::Combo("Debug View", &m_config.volumetric_fog_debug_mode, debug_modes, IM_ARRAYSIZE(debug_modes));
+        ImGui::SliderInt("Debug Z Slice", &m_config.volumetric_fog_debug_slice, 0, 63);
+        ImGui::SliderFloat(
+            "Debug Exposure", &m_config.volumetric_fog_debug_exposure, 0.1f, 64.0f, "%.2f"
+        );
+        ImGui::TextWrapped(
+            "Select 'volumetric_fog_debug' from the framebuffer list to inspect the current froxel Z slice."
+        );
+
+        ImGui::Separator();
+        ImGui::Checkbox("Run Day-1 3D Texture Smoke Test", &m_config.volumetric_fog_smoke_test_enabled);
+        ImGui::TextWrapped(
+            "Development-only validation of Vulkan RWTexture3D write, Texture3D sample, resource transitions and GPU timing."
+        );
         ImGui::TreePop();
     }
 

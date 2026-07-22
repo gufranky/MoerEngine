@@ -150,6 +150,100 @@ struct SsrPipelineBindlessParam {
     uint  gbuffer_metal_rough_ao;
 };
 
+// View-aligned froxel medium used by the volumetric-fog injection pass.
+// RGB stores unshadowed ambient in-scattering and A stores extinction.
+struct VolumetricFogInjectParam {
+    float4x4 clip2world;
+    float4x4 world2view;
+
+    float3 camera_position;
+    float  near_clip;
+
+    float3 albedo;
+    float  far_clip;
+
+    float3 ambient_color;
+    float  max_distance;
+
+    float base_density;
+    float height_falloff;
+    float height_offset;
+    float extinction_scale;
+
+    float ambient_intensity;
+    float scattering_intensity;
+
+    float3 directional_light_color;
+    float  phase_g;
+
+    float3 directional_light_direction;
+    float  directional_intensity;
+
+    uint  shadow_enabled;
+    uint  shadow_pcf_radius;
+    float shadow_bias;
+    float padding0;
+
+    float3 jitter;
+    float  padding1;
+};
+
+struct VolumetricFogDebugParam {
+    uint  debug_mode;
+    uint  debug_slice;
+    float extinction_scale;
+    float exposure;
+
+    uint  temporal_enabled;
+    float3 padding0;
+};
+
+struct VolumetricFogIntegrateParam {
+    float4x4 clip2world;
+    float4x4 world2view;
+
+    float3 camera_position;
+    float  near_clip;
+
+    float far_clip;
+    float max_distance;
+    float2 padding0;
+};
+
+struct VolumetricFogTemporalParam {
+    float4x4 clip2world;
+    float4x4 world2view;
+    float4x4 world2prev_clip;
+    float4x4 prev_world2view;
+
+    float3 camera_position;
+    float  near_clip;
+
+    float3 current_jitter;
+    float  far_clip;
+
+    float3 previous_jitter;
+    float  max_distance;
+
+    float history_weight;
+    float motion_weight_scale;
+    float clamp_expansion;
+    uint  history_valid;
+
+    uint  debug_slice;
+    float3 padding0;
+};
+
+struct VolumetricFogCompositeParam {
+    float near_clip;
+    float far_clip;
+    float max_distance;
+    uint  volume_depth;
+
+    uint2 output_resolution;
+    float2 padding0;
+};
+
 struct SmaaSharedPipelineBindlessParam {
     float4x4 clip2world;
     float4x4 clip2prev_clip; // = previous_view_projection * current_inverse_view_projection
