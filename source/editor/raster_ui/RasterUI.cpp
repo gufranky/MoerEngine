@@ -882,6 +882,22 @@ void RasterUI::ShowConfig() {
         ImGui::SliderFloat(
             "Ambient Intensity", &m_config.volumetric_fog_ambient_intensity, 0.0f, 8.0f, "%.3f"
         );
+        ImGui::SeparatorText("Moer Dynamic Indirect Lighting");
+        ImGui::Checkbox(
+            "Inject Probe GI Into Fog", &m_config.volumetric_fog_probe_gi_enabled
+        );
+        ImGui::SliderFloat(
+            "Fog Probe GI Intensity",
+            &m_config.volumetric_fog_probe_gi_intensity,
+            0.0f,
+            4.0f,
+            "%.3f"
+        );
+        ImGui::TextWrapped(
+            "Samples Moer's ray-query Probe GI once per 4x4x4 froxel workgroup, shares it "
+            "across 64 froxels, and rotates a tetrahedral irradiance direction over four "
+            "temporally accumulated frames."
+        );
         ImGui::SliderFloat(
             "Scattering Intensity", &m_config.volumetric_fog_scattering_intensity, 0.0f, 8.0f, "%.3f"
         );
@@ -896,6 +912,42 @@ void RasterUI::ShowConfig() {
         );
         ImGui::SliderFloat(
             "Fog Max Distance", &m_config.volumetric_fog_max_distance, 1.0f, 500.0f, "%.1f"
+        );
+        ImGui::SliderFloat(
+            "Fog Start Distance", &m_config.volumetric_fog_start_distance, 0.0f, 100.0f, "%.2f"
+        );
+        ImGui::SliderFloat(
+            "Near Fade In Distance", &m_config.volumetric_fog_near_fade_distance, 0.0f, 50.0f, "%.2f"
+        );
+
+        ImGui::SeparatorText("Local Fog Volume");
+        ImGui::Checkbox("Enable Local Fog Volume", &m_config.volumetric_fog_local_volume_enabled);
+        ImGui::SliderFloat3(
+            "Local Volume Center", (float*)&m_config.volumetric_fog_local_volume_center, -30.0f, 30.0f, "%.2f"
+        );
+        ImGui::SliderFloat(
+            "Local Volume Radius", &m_config.volumetric_fog_local_volume_radius, 0.1f, 50.0f, "%.2f"
+        );
+        ImGui::SliderFloat(
+            "Local Volume Density", &m_config.volumetric_fog_local_volume_density, 0.0f, 0.25f, "%.4f"
+        );
+        ImGui::SliderFloat(
+            "Local Edge Falloff", &m_config.volumetric_fog_local_volume_edge_falloff, 0.25f, 8.0f, "%.2f"
+        );
+        ImGui::SliderFloat(
+            "Local Height Falloff", &m_config.volumetric_fog_local_volume_height_falloff, 0.0f, 2.0f, "%.3f"
+        );
+        ImGui::SliderFloat(
+            "Local Height Offset", &m_config.volumetric_fog_local_volume_height_offset, -20.0f, 20.0f, "%.2f"
+        );
+        ImGui::ColorEdit3("Local Fog Albedo", (float*)&m_config.volumetric_fog_local_volume_albedo);
+        ImGui::ColorEdit3(
+            "Local Fog Emissive",
+            (float*)&m_config.volumetric_fog_local_volume_emissive,
+            ImGuiColorEditFlags_HDR | ImGuiColorEditFlags_Float
+        );
+        ImGui::SliderFloat(
+            "Local Phase Anisotropy (g)", &m_config.volumetric_fog_local_volume_phase_g, -0.9f, 0.9f, "%.3f"
         );
 
         ImGui::SeparatorText("Temporal Reprojection");

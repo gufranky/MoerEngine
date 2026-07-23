@@ -305,11 +305,14 @@ source/runtime/render/shaderheaders/shared/raster/ShaderParameters.h
 - 在 Sponza 建立固定相机、固定灯光和固定曝光测试位；
 - 在 UE 建立尽可能相同的测试场景或使用等价几何；
 - 对齐密度、高度衰减、最大距离、Albedo、Anisotropy；
+- 分别比较关闭间接光、静态/预计算间接光和动态间接光，避免把曝光或固定环境色误判为 GI；
+- 利用 MoerEngine 的动态 Ray Query Probe GI，为 Froxel 注入可随场景更新的间接光；
+- 对 Probe GI 关闭、强度 1 和强度 4 做 A/B，检查彩色反弹、室内外过渡、漏光与时域稳定性；
 - 调整 Z 分布、阴影采样和历史权重；
 - 输出关闭雾、MoerEngine、UE 三组截图；
 - 记录不能对齐的原因，区分算法差距与场景/曝光差距。
 
-交付：至少 3 个固定机位的 UE 对照图；光柱、远景衰减和高度分层主观接近。
+交付：至少 3 个固定机位的 UE 对照图；光柱、远景衰减、高度分层和间接雾光主观接近；形成一项基于 MoerEngine 特性的可解释优化。
 
 #### Day 9：鲁棒性与可选增强
 
@@ -557,3 +560,73 @@ UE 官方性能数据仅用于方法参考，不直接作为横向成绩，因�
 - 进一步用静止镜头做 12 帧 A/B：关闭 Probe GI 与 RTAO 后无雾底噪为 0；开启雾与 Jitter 后平均帧差为 1.16/255，关闭 Jitter 后降为 0；保留 Jitter、关闭体积 CSM 后仍为 0.96/255，证明 Jitter 是主因，CSM 只放大高对比边界。根因是 Temporal Pass 把已经代表“固定 Froxel 单元时间平均”的历史纹理继续按相邻两帧 Halton 差值平移重采样。现改为稳定网格语义：Jitter 仅用于当帧注入取样，历史重投影使用未抖动单元中心，静止相机精确回到同一历史 Texel。
 - 稳定历史网格后继续隔离，确认剩余可见闪烁集中在开启 CSM 的光柱与遮挡轮廓。原因是二值阴影比较使用了逐帧变化的 Jitter 世界坐标，PCF 核会在高对比阴影边界反复跨边。现将光照相位与 CSM 查询固定到未抖动 Froxel 中心，只保留密度取样的空间 Jitter，在保留深度层带抑制能力的同时消除阴影轮廓随机游走。
 - 2026-07-22 复测：Debug 构建通过；在 Probe GI/RTAO 关闭的隔离环境中，以 `CSM=On + Froxel Jitter=On + Temporal=On` 连续观察静止帧，并执行跨 Froxel 的前移与小幅连续运动，未再观察到光柱/遮挡轮廓随机游走或运动后回跳。恢复 Probe GI 与 RTAO 后完整渲染链路仍稳定。运行日志仅包含预期的设置变更和 camera-cut 历史重置，无体积雾着色器、资源或 NaN 错误。
+
+### 2026-07-23：Day 8 MoerEngine 特性驱动的动态间接雾光
+
+- 审计确认 MoerEngine 已有硬件 Ray Query Probe GI：支持多级自适应探针层次、稀疏 Brick、流式加载与预取、脏区域跟踪、更新调度、辐照度/可见性 Atlas，并通过统一 `LightingData` 和 Bindless Handle 提供给光栅着色器；体积雾注光位于 Probe 更新之后，可直接消费本帧已发布的探针数据。
+- 原体积雾只有固定颜色的 Ambient 项，它不能随房间、遮挡和表面反射颜色变化，浓雾时容易表现为全屏统一染色；逐 Froxel 执行完整 Probe GI 层次查询虽能解决空间变化，但 Medium 网格每帧约有 92 万个 Froxel，查询、Atlas 采样和着色器编译复杂度都过高。
+- 已实现“工作组级空间摊销 + 时域方向摊销”：每个 `4×4×4` 工作组只由一个线程在组中心查询一次 Probe GI，并通过 12 字节 `groupshared float3` 共享给 64 个 Froxel；无表面法线的参与介质每帧从四个四面体方向中选一个方向查询，已有体积雾历史重投影在四帧内重建方向平均。
+- Probe GI 返回的半球辐照度除以 `PI`，近似转换为可用于各向同性环境入射的平均辐亮度，再与直接方向光、固定环境项共同参与单次散射；没有新增三维纹理、Render Pass 或 Dispatch。
+- 首版在同一 Shader 内查询四个方向，导致运行时 DXC 冷编译超过 3 分钟；改为每帧一个方向后，冷编译约 85～95 秒并可正常完成。这一结果说明时域摊销不仅降低 GPU 查询量，也控制了运行时着色器图规模。后续应将该变体纳入预编译/磁盘缓存，避免首次启动等待。
+- Probe GI 开关和强度已接入 Raster UI；开关或强度变化会清空雾历史，而逐帧方向轮换不会错误触发历史重置。关闭体积雾或 Probe GI 时不会执行多余查询。
+- Debug 全量构建 938 项通过，随后增量链接通过。运行时确认两个 Probe Volume、584 个探针和 12/12 Resident Brick 正常发布，Ray Query 更新有效，体积雾日志显示 `probe_gi=(1,1.00)`；未发现 Shader、资源绑定、NaN 或 Vulkan 设备错误。
+- 在 Sponza 对强度 0、1、3.8 做运行时 A/B，雾中间接亮度有可见响应，未观察到新的块状噪声和静止闪烁。编辑器整帧粗测约 28.2 ms（开）与 28.4 ms（关），差异落在调度噪声内，只能说明尚未发现明显回退，最终报告必须使用 Injection GPU Scope 与多帧统计。
+
+## 14. MoerEngine 特性、优势与研究方案定位
+
+### 14.1 可直接转化为体积雾优势的引擎特性
+
+| MoerEngine 特性 | 现有优势 | 在本方案中的用法 | 研究/工程价值 |
+|---|---|---|---|
+| 硬件 Ray Query 动态 Probe GI | 不依赖离线烘焙，可随灯光和场景更新 | 为雾注入空间变化的动态间接光 | 解决固定 Ambient 缺少遮挡、反弹色和动态响应的问题 |
+| 多层探针、稀疏 Brick、Streaming/Prefetch | 将 GI 数据集中在有效空间，支持较大场景 | 体积雾复用已经 Resident 的探针与 Atlas | 不为雾建立第二套体积光照缓存 |
+| Dirty Tracking 与 Update Scheduler | 控制动态 GI 更新预算 | 雾间接光自然继承探针更新节奏 | 可以研究“画质—更新延迟—性能”的三方权衡 |
+| Bindless 资源与共享 `LightingData` | Pass 间传递资源句柄成本低 | 注光 Shader 直接读取 Probe/Volume/Page Table/Atlas | 不新增 Descriptor 管线和 CPU 同步 |
+| C++/HLSL 共享参数头 | CPU/GPU 布局一致，迭代快 | 只新增一个方向索引和强度参数 | 降低快速实验中的布局错误 |
+| Runtime DXC + Compute 3D Pass | Shader 变体和调试迭代灵活 | 快速验证工作组共享与方向轮换 | 同时暴露冷编译复杂度，形成可量化工程问题 |
+| 已有 Froxel 时域重投影 | 能累积抖动样本并抑制低频噪声 | 四帧重建四面体方向平均 | 将时间维度用于降低单帧 GI 查询成本 |
+
+### 14.2 与 Unreal Engine 的客观差距
+
+UE 的 Volumetric Fog 同样以相机对齐 Froxel、时间重投影、局部雾体积和灯光注入为核心。其成熟度仍明显高于当前 MoerEngine：支持更完整的点光/聚光源、光照函数、粒子/材质驱动局部体积、半透明体积雾以及更完整的可伸缩性与平台验证。
+
+UE 的 Volumetric Lightmap 可为每个雾体素插值高质量的预计算间接光；Lumen 也能为体积雾提供较低质量的动态 GI。MoerEngine 当前方案不能宣称全面超过 UE，其差异化价值在于：直接复用引擎自有的硬件 Ray Query DDGI，以无需烘焙的方式让雾响应动态灯光和场景变化，并用工作组/时域摊销约束成本。这是“面向现有引擎架构的集成与优化”，而不是发明新的 GI 算法。
+
+官方参考：
+
+- [Unreal Engine Volumetric Fog](https://dev.epicgames.com/documentation/en-us/unreal-engine/volumetric-fog-in-unreal-engine)
+- [Unreal Engine Volumetric Lightmaps](https://dev.epicgames.com/documentation/en-us/unreal-engine/volumetric-lightmaps-in-unreal-engine)
+- [Unreal Engine Local Fog Volumes](https://dev.epicgames.com/documentation/en-us/unreal-engine/local-fog-volumes-in-unreal-engine)
+- [Unreal Engine Lumen Global Illumination and Reflections](https://dev.epicgames.com/documentation/en-us/unreal-engine/lumen-global-illumination-and-reflections-in-unreal-engine)
+
+### 14.3 报告中建议使用的创新表述
+
+> 针对传统 Froxel 体积雾采用固定环境色、缺少动态空间间接光，而逐体素查询动态 GI 成本过高的问题，本文基于 MoerEngine 的稀疏层次化 Ray Query Probe GI，提出工作组级空间共享与四面体方向时域摊销的间接雾光注入方法。该方法不新增体积缓存和调度 Pass，在复用现有 Probe Streaming、Dirty Tracking、Bindless LightingData 与体积雾历史重投影的前提下，使雾介质能够响应动态间接光。
+
+应避免使用“提出全新全局光照算法”或“效果超过 UE”的表述。可验证贡献是：
+
+1. 找出现有固定 Ambient 和逐 Froxel Probe 查询的质量/成本矛盾；
+2. 设计符合 MoerEngine 数据流的低侵入集成；
+3. 将空间共享和时间累积组合，理论上分别形成 64 倍空间摊销与 4 帧方向重建；
+4. 用画质、稳定性、动态响应、GPU 时间和显存证明取舍。
+
+### 14.4 最终对比实验
+
+| 实验 | 对照组 | 观察/记录 |
+|---|---|---|
+| 空间间接光 | Probe GI 关闭 / 开启 | 室内外过渡、遮挡区亮度、彩色表面反弹 |
+| 强度响应 | 0 / 1 / 4 | 是否线性响应、是否过曝、是否放大漏光 |
+| 动态响应 | 移动灯光或改变 Probe 脏区域 | 雾光更新延迟、脏 Brick 调度、稳定时间 |
+| 时域稳定性 | 静止 32 帧、缓慢平移、快速旋转 | 平均/最大帧差、鬼影、工作组边界 |
+| 性能 | GI 关闭 / 每组单方向 / 参考逐 Froxel 查询 | Injection GPU Scope 的均值、P95 和整帧时间 |
+| 资源 | 改进前 / 改进后 | 新增纹理 0、额外组共享内存 12 字节、Descriptor/Dispatch 数不变 |
+| UE 对比 | UE VLM / UE Lumen / Moer Probe GI | 烘焙需求、动态性、间接光质量、GPU 代价 |
+
+### 14.5 当前限制和后续优化
+
+- 一个 `4×4×4` 组共享一个 GI 样本，探针照明变化剧烈时可能出现组边界；可在 High 档改为 `2×2×2`，或对相邻组结果做低成本插值。
+- 完整四方向重建依赖时间历史；关闭 Temporal 时当前实现固定使用一个方向，质量低于稳定后的四帧结果。
+- 结果继承 Probe GI 自身的漏光、可见性偏差、Streaming 延迟和更新预算，最终调参不能仅靠提高雾强度掩盖这些问题。
+- 当前只有一个解析局部雾体积，且尚未覆盖 UE 的点光/聚光体积阴影、Volume Material、粒子雾和半透明逐像素雾；这些仍是完成度差距，不应包装成已对齐。
+- 运行时冷编译仍偏慢。短期应预热/缓存体积雾 Probe GI Shader；进一步可把 Probe GI 采样拆为低分辨率缓存，以减少 Shader 图规模并允许跨 Pass 复用。
+- 当前 A/B 只有编辑器整帧粗测，最终验收前必须用 GPU Scope 做预热后的多帧统计，并在固定曝光下保存同机位截图。

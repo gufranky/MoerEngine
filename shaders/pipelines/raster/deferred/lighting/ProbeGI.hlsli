@@ -369,7 +369,10 @@ float4 ProbeGILoadDirectionalVisibility(
     if (lighting_data.probe_system_atlas.w != 0u) {
         TextureHandle visibility_texture = TextureHandle(lighting_data.probe_system_atlas.w);
         const float2 atlas_uv = ProbeGIGetAtlasTextureUv(probe_index, probe_to_surface_dir);
-        const float4 visibility_moments = visibility_texture.Sample2D<float4>(atlas_uv);
+        // Probe atlases have one authored resolution and no meaningful screen-space
+        // derivatives. Explicit LOD keeps the sampler valid for both pixel and compute users.
+        const float4 visibility_moments =
+            visibility_texture.SampleLevel<float4>(atlas_uv, 0.0);
         return lerp(probe.visibility, visibility_moments, saturate(visibility_moments.w));
     }
 
@@ -398,7 +401,8 @@ float3 ProbeGILoadDirectionalIrradiance(
     if (lighting_data.probe_system_atlas.z != 0u) {
         TextureHandle irradiance_texture = TextureHandle(lighting_data.probe_system_atlas.z);
         const float2 atlas_uv = ProbeGIGetAtlasTextureUv(probe_index, normalize(normal));
-        const float4 irradiance_texel = irradiance_texture.Sample2D<float4>(atlas_uv);
+        const float4 irradiance_texel =
+            irradiance_texture.SampleLevel<float4>(atlas_uv, 0.0);
         return lerp(aggregate_irradiance, irradiance_texel.rgb, saturate(irradiance_texel.w));
     }
 

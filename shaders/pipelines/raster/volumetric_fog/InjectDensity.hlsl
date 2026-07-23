@@ -5,11 +5,14 @@
 #include "core/common/Common.hlsl"
 BINDLESS_BINDINGS(3, 2, 4, 5)
 #include "shared/raster/ShaderParameters.h"
+#include "pipelines/raster/deferred/lighting/ProbeGI.hlsli"
 
 [[vk::push_constant]] ConstantBuffer<Moer::VolumetricFogInjectParam> param;
 [[vk::binding(0, 0)]] ConstantBuffer<Moer::LightingData> lighting_data;
 [[vk::binding(1, 0)]] RWTexture3D<float4> volume_texture;
 [[vk::binding(2, 0)]] RWTexture3D<float>  shadow_volume;
+
+groupshared float3 group_probe_radiance;
 
 float3 world_pos_from_depth(float depth, float2 screen_uv, float4x4 clip2world) {
     const float4 clip = float4(screen_uv.x * 2.0 - 1.0, 1.0 - screen_uv.y * 2.0, depth, 1.0);
@@ -77,14 +80,72 @@ float sample_csm_visibility(float3 world_position) {
     return visibility / max(sample_count, 1.0);
 }
 
+float3 stable_world_position_from_froxel(uint3 froxel_id, uint3 volume_size) {
+    const float2 uv = (float2(froxel_id.xy) + 0.5) / float2(volume_size.xy);
+    const float3 far_world = world_pos_from_depth(0.0, uv, param.clip2world);
+    const float3 ray_world = normalize(far_world - param.camera_position);
+    const float3 ray_view = mul(param.world2view, float4(ray_world, 0.0)).xyz;
+    const float slice_fraction = (float(froxel_id.z) + 0.5) / float(volume_size.z);
+    const float near_distance = max(param.near_clip, 1.0e-3);
+    const float far_distance =
+        max(min(param.max_distance, param.far_clip), near_distance + 1.0e-3);
+    const float view_depth =
+        near_distance * pow(far_distance / near_distance, slice_fraction);
+    const float ray_distance = view_depth / max(abs(ray_view.z), 1.0e-4);
+    return param.camera_position + ray_world * ray_distance;
+}
+
+float3 sample_group_probe_radiance(float3 world_position) {
+    if (param.probe_gi_direction == 0 || !ProbeGIIsEnabled(lighting_data)) {
+        return float3(0.0, 0.0, 0.0);
+    }
+
+    // Fog has no surface normal. Rotate one tetrahedral hemispherical irradiance direction per
+    // frame and let the existing temporal reprojection reconstruct the direction average. This
+    // avoids cloning the large adaptive Probe GI lookup graph four times in the compiled shader.
+    static const float inv_sqrt3 = 0.57735026919;
+    float3 basis = float3(inv_sqrt3, inv_sqrt3, inv_sqrt3);
+    if (param.probe_gi_direction == 2u) {
+        basis = float3(-inv_sqrt3, -inv_sqrt3, inv_sqrt3);
+    } else if (param.probe_gi_direction == 3u) {
+        basis = float3(-inv_sqrt3, inv_sqrt3, -inv_sqrt3);
+    } else if (param.probe_gi_direction == 4u) {
+        basis = float3(inv_sqrt3, -inv_sqrt3, -inv_sqrt3);
+    }
+
+    const float3 irradiance =
+        ProbeGISampleIrradiance(lighting_data, world_position, basis);
+    // Probe GI returns hemispherical irradiance. Dividing by PI gives an approximate mean
+    // incident radiance suitable for a low-frequency isotropic multiple-scattering term.
+    return max(irradiance, 0.0) * (1.0 / PI) * max(param.probe_gi_intensity, 0.0);
+}
+
 [numthreads(4, 4, 4)]
-void main(uint3 dispatch_thread_id : SV_DispatchThreadID) {
+void main(
+    uint3 dispatch_thread_id : SV_DispatchThreadID,
+    uint3 group_thread_id : SV_GroupThreadID,
+    uint3 group_id : SV_GroupID
+) {
     uint width;
     uint height;
     uint depth;
     volume_texture.GetDimensions(width, height, depth);
+    const uint3 volume_size = uint3(width, height, depth);
+    const bool in_bounds = all(dispatch_thread_id < volume_size);
 
-    if (any(dispatch_thread_id >= uint3(width, height, depth))) {
+    // Probe irradiance varies far more slowly than density or CSM visibility. One lane samples
+    // the center of each 4x4x4 workgroup and broadcasts 12 bytes through group shared memory,
+    // reducing Probe GI lookup positions by 64x. Four-frame directional rotation provides a
+    // further 4x temporal amortization without adding a texture or another dispatch.
+    if (all(group_thread_id == uint3(0, 0, 0))) {
+        const uint3 group_center = min(group_id * 4u + 2u, volume_size - 1u);
+        const float3 group_world_position =
+            stable_world_position_from_froxel(group_center, volume_size);
+        group_probe_radiance = sample_group_probe_radiance(group_world_position);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (!in_bounds) {
         return;
     }
 
@@ -129,26 +190,70 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID) {
 
     // Density is specified at height_offset and decays upward. Clamp the exponent to keep
     // FP16 storage stable when the camera moves far below the reference height.
+    const float near_fade = param.near_fade_distance > 1.0e-4
+        ? smoothstep(
+            0.0,
+            1.0,
+            saturate((stable_view_depth - param.start_distance) / param.near_fade_distance)
+        )
+        : (stable_view_depth >= param.start_distance ? 1.0 : 0.0);
+
     const float height_exponent = clamp(
         -param.height_falloff * (world_position.y - param.height_offset), -16.0, 16.0
     );
-    const float density    = min(max(param.base_density, 0.0) * exp(height_exponent), 64.0);
-    const float extinction = density * max(param.extinction_scale, 0.0);
+    const float global_density = min(
+        max(param.base_density, 0.0) * exp(height_exponent), 64.0
+    ) * near_fade;
 
-    const float3 scattering = extinction * saturate(param.albedo) * max(param.ambient_color, 0.0)
-        * max(param.ambient_intensity, 0.0);
+    float local_density = 0.0;
+    if (param.local_volume_enabled != 0 && param.local_volume_radius > 1.0e-3) {
+        const float radial_distance = length(
+            world_position - param.local_volume_center
+        ) / param.local_volume_radius;
+        const float radial_fade = smoothstep(0.0, 1.0, saturate(1.0 - radial_distance));
+        const float local_height_exponent = clamp(
+            -param.local_volume_height_falloff *
+                (world_position.y - param.local_volume_center.y - param.local_volume_height_offset),
+            -16.0,
+            16.0
+        );
+        local_density = min(
+            max(param.local_volume_density, 0.0) *
+                pow(radial_fade, max(param.local_volume_edge_falloff, 0.25)) *
+                exp(local_height_exponent),
+            64.0
+        ) * near_fade;
+    }
+
+    const float extinction_scale = max(param.extinction_scale, 0.0);
+    const float global_extinction = global_density * extinction_scale;
+    const float local_extinction = local_density * extinction_scale;
+    const float extinction = global_extinction + local_extinction;
+
+    const float3 ambient_irradiance = max(param.ambient_color, 0.0) *
+        max(param.ambient_intensity, 0.0);
+    const float3 indirect_radiance = ambient_irradiance + group_probe_radiance;
+    const float3 scattering =
+        (global_extinction * saturate(param.albedo) +
+         local_extinction * saturate(param.local_volume_albedo)) * indirect_radiance;
 
     const float visibility = sample_csm_visibility(stable_world_position);
     const float cos_theta = dot(
         normalize(param.directional_light_direction), -stable_ray_world
     );
-    const float phase = henyey_greenstein(cos_theta, param.phase_g);
-    const float3 directional_scattering = extinction * saturate(param.albedo)
-        * max(param.directional_light_color, 0.0) * max(param.directional_intensity, 0.0)
-        * phase * visibility;
+    const float global_phase = henyey_greenstein(cos_theta, param.phase_g);
+    const float local_phase = henyey_greenstein(cos_theta, param.local_volume_phase_g);
+    const float3 directional_scattering =
+        (global_extinction * saturate(param.albedo) * global_phase +
+         local_extinction * saturate(param.local_volume_albedo) * local_phase) *
+        max(param.directional_light_color, 0.0) * max(param.directional_intensity, 0.0) *
+        visibility;
+    const float3 local_emission = local_density * max(param.local_volume_emissive, 0.0);
 
     volume_texture[dispatch_thread_id] = float4(
-        (scattering + directional_scattering) * max(param.scattering_intensity, 0.0), extinction
+        (scattering + directional_scattering) * max(param.scattering_intensity, 0.0) +
+            local_emission,
+        extinction
     );
     shadow_volume[dispatch_thread_id] = visibility;
 }

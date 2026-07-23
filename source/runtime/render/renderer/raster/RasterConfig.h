@@ -352,10 +352,32 @@ struct RasterConfig {
     float3 volumetric_fog_albedo               = float3(0.9f, 0.92f, 1.0f);
     float3 volumetric_fog_ambient_color         = float3(0.48f, 0.62f, 0.95f);
     float  volumetric_fog_ambient_intensity     = 0.25f;
+    // Moer-specific extension: reuse the dynamic ray-query Probe GI field as low-frequency
+    // volumetric indirect lighting. Sampling is amortized once per 4x4x4 froxel workgroup and
+    // one tetrahedral direction per frame is reconstructed by the existing temporal filter.
+    bool   volumetric_fog_probe_gi_enabled       = true;
+    float  volumetric_fog_probe_gi_intensity     = 1.0f;
     float  volumetric_fog_scattering_intensity  = 0.75f;
     float  volumetric_fog_max_distance          = 60.0f;
+    // UE-style near-field controls keep the camera neighborhood readable instead of applying
+    // a uniform veil from the near plane. The default fades the medium in over the first 3 m.
+    float  volumetric_fog_start_distance        = 0.0f;
+    float  volumetric_fog_near_fade_distance    = 3.0f;
     float  volumetric_fog_directional_intensity = 0.50f;
     float  volumetric_fog_phase_g               = 0.2f;
+
+    // First UE-style local-density primitive. It is evaluated analytically in the injection
+    // pass, so it adds spatial layering without another volume texture or draw/dispatch.
+    bool   volumetric_fog_local_volume_enabled        = false;
+    float3 volumetric_fog_local_volume_center         = float3(0.0f, 2.0f, 0.0f);
+    float  volumetric_fog_local_volume_radius         = 6.0f;
+    float  volumetric_fog_local_volume_density        = 0.012f;
+    float  volumetric_fog_local_volume_edge_falloff   = 2.0f;
+    float  volumetric_fog_local_volume_height_falloff = 0.0f;
+    float  volumetric_fog_local_volume_height_offset  = 0.0f;
+    float3 volumetric_fog_local_volume_albedo         = float3(0.95f, 0.92f, 0.82f);
+    float3 volumetric_fog_local_volume_emissive       = float3(0.0f);
+    float  volumetric_fog_local_volume_phase_g        = 0.2f;
     bool   volumetric_fog_shadows_enabled       = true;
     int    volumetric_fog_shadow_pcf_radius     = 1;
     float  volumetric_fog_shadow_bias           = 0.0005f;

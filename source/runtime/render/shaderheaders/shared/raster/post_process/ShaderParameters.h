@@ -186,6 +186,26 @@ struct VolumetricFogInjectParam {
 
     float3 jitter;
     float  padding1;
+
+    float start_distance;
+    float near_fade_distance;
+    uint  local_volume_enabled;
+    float local_volume_radius;
+
+    float3 local_volume_center;
+    float  local_volume_density;
+
+    float3 local_volume_albedo;
+    float  local_volume_edge_falloff;
+
+    float3 local_volume_emissive;
+    float  local_volume_phase_g;
+
+    float local_volume_height_falloff;
+    float local_volume_height_offset;
+    // 0 = disabled, 1..4 = tetrahedral irradiance direction sampled this frame.
+    uint  probe_gi_direction;
+    float probe_gi_intensity;
 };
 
 struct VolumetricFogDebugParam {

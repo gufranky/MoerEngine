@@ -178,7 +178,38 @@ void VolumetricFogPass::Process(RasterContext& context, const RasterConfig& conf
     inject_param.height_offset       = config.volumetric_fog_height_offset;
     inject_param.extinction_scale    = config.volumetric_fog_extinction_scale;
     inject_param.ambient_intensity   = config.volumetric_fog_ambient_intensity;
+    const bool inject_probe_gi =
+        config.volumetric_fog_probe_gi_enabled && config.probe_gi_enabled;
+    // A full Probe GI hierarchy lookup is intentionally left as a single call in the compiled
+    // shader. The existing temporal filter rotates through a tetrahedral basis over four frames
+    // and reconstructs the direction-averaged result without duplicating the large lookup graph.
+    inject_param.probe_gi_direction = inject_probe_gi
+        ? (config.volumetric_fog_temporal_enabled
+               ? 1u + static_cast<uint>(temporal_frame_index & 3u)
+               : 1u)
+        : 0u;
+    inject_param.probe_gi_intensity = std::max(
+        config.volumetric_fog_probe_gi_intensity, 0.0f
+    );
     inject_param.scattering_intensity = config.volumetric_fog_scattering_intensity;
+    inject_param.start_distance      = std::max(config.volumetric_fog_start_distance, 0.0f);
+    inject_param.near_fade_distance  = std::max(config.volumetric_fog_near_fade_distance, 0.0f);
+    inject_param.local_volume_enabled = config.volumetric_fog_local_volume_enabled ? 1u : 0u;
+    inject_param.local_volume_center  = config.volumetric_fog_local_volume_center;
+    inject_param.local_volume_radius  = std::max(config.volumetric_fog_local_volume_radius, 0.01f);
+    inject_param.local_volume_density = std::max(config.volumetric_fog_local_volume_density, 0.0f);
+    inject_param.local_volume_edge_falloff = std::max(
+        config.volumetric_fog_local_volume_edge_falloff, 0.25f
+    );
+    inject_param.local_volume_height_falloff = std::max(
+        config.volumetric_fog_local_volume_height_falloff, 0.0f
+    );
+    inject_param.local_volume_height_offset = config.volumetric_fog_local_volume_height_offset;
+    inject_param.local_volume_albedo = config.volumetric_fog_local_volume_albedo;
+    inject_param.local_volume_emissive = config.volumetric_fog_local_volume_emissive;
+    inject_param.local_volume_phase_g = std::clamp(
+        config.volumetric_fog_local_volume_phase_g, -0.9f, 0.9f
+    );
 
     const entt::entity directional_light_entity = context.scene.GetMainDirectionalLightEntity();
     const bool has_directional_light =
@@ -239,12 +270,38 @@ void VolumetricFogPass::Process(RasterContext& context, const RasterConfig& conf
         config.volumetric_fog_jitter_enabled ? 1.0f : 0.0f,
         0.0f
     );
+    const float4 current_fog_state5(
+        inject_param.start_distance,
+        inject_param.near_fade_distance,
+        static_cast<float>(inject_param.local_volume_enabled),
+        inject_param.local_volume_radius
+    );
+    const float4 current_fog_state6(
+        inject_param.local_volume_center, inject_param.local_volume_density
+    );
+    const float4 current_fog_state7(
+        inject_param.local_volume_albedo, inject_param.local_volume_edge_falloff
+    );
+    const float4 current_fog_state8(
+        inject_param.local_volume_emissive, inject_param.local_volume_phase_g
+    );
+    const float4 current_fog_state9(
+        inject_param.local_volume_height_falloff,
+        inject_param.local_volume_height_offset,
+        inject_param.probe_gi_direction != 0u ? 1.0f : 0.0f,
+        inject_param.probe_gi_intensity
+    );
     const bool fog_settings_changed = temporal_history_valid &&
         (SquaredLengthf(current_fog_state0 - previous_fog_state0) > 1.0e-10f ||
          SquaredLengthf(current_fog_state1 - previous_fog_state1) > 1.0e-10f ||
          SquaredLengthf(current_fog_state2 - previous_fog_state2) > 1.0e-10f ||
          SquaredLengthf(current_fog_state3 - previous_fog_state3) > 1.0e-10f ||
-         SquaredLengthf(current_fog_state4 - previous_fog_state4) > 1.0e-10f);
+         SquaredLengthf(current_fog_state4 - previous_fog_state4) > 1.0e-10f ||
+         SquaredLengthf(current_fog_state5 - previous_fog_state5) > 1.0e-10f ||
+         SquaredLengthf(current_fog_state6 - previous_fog_state6) > 1.0e-10f ||
+         SquaredLengthf(current_fog_state7 - previous_fog_state7) > 1.0e-10f ||
+         SquaredLengthf(current_fog_state8 - previous_fog_state8) > 1.0e-10f ||
+         SquaredLengthf(current_fog_state9 - previous_fog_state9) > 1.0e-10f);
     if (camera_cut || projection_changed || fog_settings_changed) {
         LOG_DEBUG(
             "[VolumetricFog][Day5] History reset: camera_cut={}, projection_changed={}, settings_changed={}.",
@@ -270,7 +327,7 @@ void VolumetricFogPass::Process(RasterContext& context, const RasterConfig& conf
     debug_param.exposure         = config.volumetric_fog_debug_exposure;
     debug_param.temporal_enabled = config.volumetric_fog_temporal_enabled ? 1u : 0u;
 
-    context.cmd_list.PushScopeWithTimeScope("Volumetric Fog Day3 Light Injection");
+    context.cmd_list.PushScopeWithTimeScope("Volumetric Fog Light And Probe GI Injection");
     context.cmd_list.Compute(
         inject_pipeline,
         inject_param,
@@ -281,7 +338,7 @@ void VolumetricFogPass::Process(RasterContext& context, const RasterConfig& conf
     )
         .Dispatch(
             uint3((volume_size.x + 3u) / 4u, (volume_size.y + 3u) / 4u, (volume_size.z + 3u) / 4u),
-            "Volumetric Fog Inject Density Directional Light CSM"
+            "Volumetric Fog Inject Density Directional Light CSM Probe GI"
         );
     context.cmd_list.PopScopeWithTimeScope();
 
@@ -376,6 +433,11 @@ void VolumetricFogPass::Process(RasterContext& context, const RasterConfig& conf
     previous_fog_state2 = current_fog_state2;
     previous_fog_state3 = current_fog_state3;
     previous_fog_state4 = current_fog_state4;
+    previous_fog_state5 = current_fog_state5;
+    previous_fog_state6 = current_fog_state6;
+    previous_fog_state7 = current_fog_state7;
+    previous_fog_state8 = current_fog_state8;
+    previous_fog_state9 = current_fog_state9;
     ++temporal_frame_index;
 
     const uint2 debug_size = context.textures.volumetric_fog_debug.GetSize();
@@ -397,7 +459,9 @@ void VolumetricFogPass::Process(RasterContext& context, const RasterConfig& conf
     if (!day2_was_enabled) {
         LOG_INFO(
             "[VolumetricFog][Day3] Directional injection active: froxels={}x{}x{}, density={:.4f}, falloff={:.3f}, "
-            "height={:.2f}, max_distance={:.1f}, phase_g={:.3f}, csm_shadows={}, pcf_radius={}, "
+            "height={:.2f}, distance=({:.1f}, {:.1f}, {:.1f}), phase_g={:.3f}, local_volume={}, "
+            "probe_gi=({}, {:.2f}), "
+            "csm_shadows={}, pcf_radius={}, "
             "debug_mode={}, debug_slice={}.",
             volume_size.x,
             volume_size.y,
@@ -405,8 +469,13 @@ void VolumetricFogPass::Process(RasterContext& context, const RasterConfig& conf
             config.volumetric_fog_base_density,
             config.volumetric_fog_height_falloff,
             config.volumetric_fog_height_offset,
+            inject_param.start_distance,
+            inject_param.near_fade_distance,
             inject_param.max_distance,
             inject_param.phase_g,
+            inject_param.local_volume_enabled,
+            inject_param.probe_gi_direction != 0u ? 1u : 0u,
+            inject_param.probe_gi_intensity,
             inject_param.shadow_enabled,
             inject_param.shadow_pcf_radius,
             debug_param.debug_mode,

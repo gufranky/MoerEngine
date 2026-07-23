@@ -140,6 +140,11 @@ private:
     float4 previous_fog_state2 = float4(0.0f);
     float4 previous_fog_state3 = float4(0.0f);
     float4 previous_fog_state4 = float4(0.0f);
+    float4 previous_fog_state5 = float4(0.0f);
+    float4 previous_fog_state6 = float4(0.0f);
+    float4 previous_fog_state7 = float4(0.0f);
+    float4 previous_fog_state8 = float4(0.0f);
+    float4 previous_fog_state9 = float4(0.0f);
     float4x4 previous_view_projection = float4x4::Identity();
     float4x4 previous_view = float4x4::Identity();
 };
