@@ -182,10 +182,10 @@ struct VolumetricFogInjectParam {
     uint  shadow_enabled;
     uint  shadow_pcf_radius;
     float shadow_bias;
-    float padding0;
+    uint  jitter_frame_index;
 
     float3 jitter;
-    float  padding1;
+    uint   jitter_mode;
 
     float start_distance;
     float near_fade_distance;
@@ -206,6 +206,11 @@ struct VolumetricFogInjectParam {
     // 0 = disabled, 1..4 = tetrahedral irradiance direction sampled this frame.
     uint  probe_gi_direction;
     float probe_gi_intensity;
+
+    uint  volume_radiance_cache_enabled;
+    uint  volume_radiance_cache_buffer;
+    float volume_radiance_cache_directionality;
+    uint  volume_radiance_cache_debug_slice;
 };
 
 struct VolumetricFogDebugParam {
@@ -251,7 +256,8 @@ struct VolumetricFogTemporalParam {
     uint  history_valid;
 
     uint  debug_slice;
-    float3 padding0;
+    float reactive_strength;
+    float2 padding0;
 };
 
 struct VolumetricFogCompositeParam {
@@ -261,7 +267,8 @@ struct VolumetricFogCompositeParam {
     uint  volume_depth;
 
     uint2 output_resolution;
-    float2 padding0;
+    uint  reconstruction_filter_enabled;
+    float reconstruction_filter_strength;
 };
 
 struct SmaaSharedPipelineBindlessParam {

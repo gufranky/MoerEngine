@@ -893,11 +893,79 @@ void RasterUI::ShowConfig() {
             4.0f,
             "%.3f"
         );
-        ImGui::TextWrapped(
-            "Samples Moer's ray-query Probe GI once per 4x4x4 froxel workgroup, shares it "
-            "across 64 froxels, and rotates a tetrahedral irradiance direction over four "
-            "temporally accumulated frames."
+        ImGui::Checkbox(
+            "Adaptive Sparse Volume Radiance Cache",
+            &m_config.volumetric_fog_radiance_cache_enabled
         );
+        ImGui::SliderFloat(
+            "Volume Cache Directionality",
+            &m_config.volumetric_fog_radiance_cache_directionality,
+            0.0f,
+            1.0f,
+            "%.3f"
+        );
+        ImGui::TextWrapped(
+            "The volume cache reuses Moer's adaptive sparse Probe layout and streaming, but "
+            "stores an independent first-order directional-radiance payload. One lookup is "
+            "shared by each 4x4x4 froxel workgroup; the old four-frame surface-Probe estimate "
+            "is retained only as a fallback."
+        );
+        if (ImGui::TreeNode("Sparse Cache Adaptivity")) {
+            ImGui::SliderFloat(
+                "Medium Density Threshold",
+                &m_config.volumetric_fog_radiance_cache_density_threshold,
+                0.00001f,
+                0.02f,
+                "%.5f",
+                ImGuiSliderFlags_Logarithmic
+            );
+            ImGui::SliderFloat(
+                "Medium Gradient Threshold",
+                &m_config.volumetric_fog_radiance_cache_gradient_threshold,
+                0.0f,
+                1.0f,
+                "%.3f"
+            );
+            ImGui::SliderFloat(
+                "Screen Contribution Weight",
+                &m_config.volumetric_fog_radiance_cache_screen_weight,
+                0.0f,
+                4.0f,
+                "%.2f"
+            );
+            ImGui::SliderFloat(
+                "Cache Update Priority Weight",
+                &m_config.volumetric_fog_radiance_cache_priority_weight,
+                0.0f,
+                8.0f,
+                "%.2f"
+            );
+            ImGui::SliderFloat(
+                "Cache History Weight",
+                &m_config.volumetric_fog_radiance_cache_history_weight,
+                0.0f,
+                0.98f,
+                "%.3f"
+            );
+            ImGui::SliderFloat(
+                "Approx. Multiple Scattering",
+                &m_config.volumetric_fog_radiance_cache_multi_scatter,
+                0.0f,
+                0.5f,
+                "%.3f"
+            );
+            ImGui::SliderInt(
+                "Medium Transmittance Steps",
+                &m_config.volumetric_fog_radiance_cache_transmittance_steps,
+                2,
+                12
+            );
+            ImGui::TextWrapped(
+                "The shared sparse hierarchy refines the union of surface geometry and participating-medium needs. "
+                "Density gradients, projected cell size and update age jointly prioritize resident bricks."
+            );
+            ImGui::TreePop();
+        }
         ImGui::SliderFloat(
             "Scattering Intensity", &m_config.volumetric_fog_scattering_intensity, 0.0f, 8.0f, "%.3f"
         );
@@ -952,7 +1020,31 @@ void RasterUI::ShowConfig() {
 
         ImGui::SeparatorText("Temporal Reprojection");
         ImGui::Checkbox("Enable Temporal Reprojection", &m_config.volumetric_fog_temporal_enabled);
-        ImGui::Checkbox("Enable Froxel Jitter", &m_config.volumetric_fog_jitter_enabled);
+        if (ImGui::TreeNode("Froxel Jitter Mode")) {
+            static const char* jitter_modes[] = {
+                "Off",
+                "Halton 2/3/5 (Baseline)",
+                "White Noise (Control)",
+                "FAST XY",
+                "FAST XYZ Offset"
+            };
+            int jitter_mode = static_cast<int>(m_config.volumetric_fog_jitter_mode);
+            if (ImGui::Combo("Froxel Jitter", &jitter_mode, jitter_modes, IM_ARRAYSIZE(jitter_modes))) {
+                m_config.volumetric_fog_jitter_mode = static_cast<uint8>(jitter_mode);
+            }
+            const auto selected_jitter_mode =
+                static_cast<EVolumetricFogJitterMode>(m_config.volumetric_fog_jitter_mode);
+            if (selected_jitter_mode == EVolumetricFogJitterMode::FAST_XY) {
+                ImGui::TextWrapped(
+                    "FAST uses the optimized XY/time sequence directly; depth slices remain correlated."
+                );
+            } else if (selected_jitter_mode == EVolumetricFogJitterMode::FAST_XYZ_OFFSET) {
+                ImGui::TextWrapped(
+                    "FAST offsets each depth slice in XY to decorrelate Z; compare against FAST XY."
+                );
+            }
+            ImGui::TreePop();
+        }
         ImGui::SliderFloat(
             "History Weight", &m_config.volumetric_fog_history_weight, 0.0f, 0.99f, "%.3f"
         );
@@ -969,6 +1061,24 @@ void RasterUI::ShowConfig() {
             "History Reset Angle", &m_config.volumetric_fog_history_reset_angle, 1.0f, 90.0f, "%.1f deg"
         );
 
+        ImGui::SeparatorText("Low-Resolution Reconstruction");
+        ImGui::Checkbox(
+            "Enable Depth-Aware Reconstruction",
+            &m_config.volumetric_fog_reconstruction_filter_enabled
+        );
+        ImGui::SliderFloat(
+            "Reconstruction Strength",
+            &m_config.volumetric_fog_reconstruction_filter_strength,
+            0.0f,
+            1.0f,
+            "%.2f"
+        );
+        ImGui::TextWrapped(
+            "Detects gradients in the low-resolution integrated fog field and filters only "
+            "along the local edge tangent. Opaque-scene depth rejection prevents fog from "
+            "leaking across geometry."
+        );
+
         static const char* debug_modes[] = {
             "Incident Scattering",
             "Density",
@@ -976,7 +1086,12 @@ void RasterUI::ShowConfig() {
             "CSM Shadow Visibility",
             "Integrated Scattering",
             "Transmittance",
-            "History Weight"
+            "History Weight",
+            "Radiance Cache L0/L1",
+            "Radiance Cache Coverage",
+            "Radiance Cache Adaptive Level",
+            "Radiance Cache Update Age",
+            "Radiance Cache Transport Activity"
         };
         ImGui::Combo("Debug View", &m_config.volumetric_fog_debug_mode, debug_modes, IM_ARRAYSIZE(debug_modes));
         ImGui::SliderInt("Debug Z Slice", &m_config.volumetric_fog_debug_slice, 0, 63);

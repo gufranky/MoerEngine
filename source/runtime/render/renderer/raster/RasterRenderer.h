@@ -23,6 +23,7 @@ class CooperativeOpsPass;
 class AaPass;
 class BloomPass;
 class TonemappingPass;
+class VolumetricFogBenchmark;
 
 #if WITH_CUDA
 class CudaPass;
@@ -85,6 +86,7 @@ private:
     UniquePtr<AaPass>                      aa_pass;
     UniquePtr<BloomPass>                   bloom_pass;
     UniquePtr<TonemappingPass>             tonemapping_pass;
+    UniquePtr<VolumetricFogBenchmark>       volumetric_fog_benchmark;
 
 #if WITH_CUDA
     UniquePtr<CudaPass>     cuda_pass;

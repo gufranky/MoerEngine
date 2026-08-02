@@ -66,7 +66,9 @@ float4 load_integrated_depth_aware(
     float2 volume_position,
     float boundary_position,
     uint2 volume_dimensions,
-    float center_view_depth
+    float center_view_depth,
+    out float2 fog_edge_gradient,
+    out float fog_edge_confidence
 ) {
     const float2 clamped_position = clamp(
         volume_position, 0.0, float2(volume_dimensions - 1u)
@@ -88,27 +90,119 @@ float4 load_integrated_depth_aware(
         interpolation.x * interpolation.y
     };
 
+    float4 sample_fog[4];
+    float geometry_weights[4];
     float4 weighted_fog = 0.0;
     float total_weight = 0.0;
     [unroll]
     for (uint sample_index = 0u; sample_index < 4u; ++sample_index) {
-        const float weight = bilinear_weights[sample_index] * geometry_depth_weight(
+        sample_fog[sample_index] = load_integrated_boundary(
+            sample_coordinates[sample_index], boundary_position
+        );
+        geometry_weights[sample_index] = geometry_depth_weight(
             center_view_depth, sample_coordinates[sample_index], volume_dimensions
         );
-        weighted_fog += load_integrated_boundary(
-            sample_coordinates[sample_index], boundary_position
-        ) * weight;
+        const float weight = bilinear_weights[sample_index] * geometry_weights[sample_index];
+        weighted_fog += sample_fog[sample_index] * weight;
         total_weight += weight;
     }
 
     if (total_weight > 1.0e-5) {
-        return weighted_fog / total_weight;
+        const float4 center_fog = weighted_fog / total_weight;
+        const float center_feature =
+            dot(max(center_fog.rgb, 0.0), float3(0.2126, 0.7152, 0.0722)) +
+            (1.0 - saturate(center_fog.a));
+        float features[4];
+        [unroll]
+        for (uint feature_index = 0u; feature_index < 4u; ++feature_index) {
+            const float raw_feature =
+                dot(max(sample_fog[feature_index].rgb, 0.0), float3(0.2126, 0.7152, 0.0722)) +
+                (1.0 - saturate(sample_fog[feature_index].a));
+            // Do not interpret a foreground/background depth discontinuity as a volumetric edge.
+            features[feature_index] = lerp(
+                center_feature,
+                raw_feature,
+                saturate(geometry_weights[feature_index] * 2.0)
+            );
+        }
+
+        fog_edge_gradient = 0.5 * float2(
+            (features[1] - features[0]) + (features[3] - features[2]),
+            (features[2] - features[0]) + (features[3] - features[1])
+        );
+        const float feature_max = max(max(features[0], features[1]), max(features[2], features[3]));
+        const float feature_min = min(min(features[0], features[1]), min(features[2], features[3]));
+        fog_edge_confidence = saturate(
+            (feature_max - feature_min) / max(abs(center_feature), 0.02) * 1.5
+        );
+        return center_fog;
     }
 
     // All four representatives can disagree at a very thin silhouette. Use the nearest column
     // instead of allowing background fog to bleed across the geometry edge.
     const uint2 nearest_xy = uint2(round(clamped_position));
+    fog_edge_gradient = 0.0;
+    fog_edge_confidence = 0.0;
     return load_integrated_boundary(nearest_xy, boundary_position);
+}
+
+float4 reconstruct_integrated_fog(
+    float2 volume_position,
+    float boundary_position,
+    uint2 volume_dimensions,
+    float center_view_depth
+) {
+    float2 edge_gradient;
+    float edge_confidence;
+    const float4 center = load_integrated_depth_aware(
+        volume_position,
+        boundary_position,
+        volume_dimensions,
+        center_view_depth,
+        edge_gradient,
+        edge_confidence
+    );
+    if (param.reconstruction_filter_enabled == 0u ||
+        param.reconstruction_filter_strength <= 1.0e-4) {
+        return center;
+    }
+
+    // Flat fog already reconstructs well with the four bilinear taps above. Only spend extra
+    // samples at a real volumetric-lighting edge, and smooth along its tangent rather than
+    // isotropically widening the light shaft across its normal.
+    const float edge_blend = saturate(param.reconstruction_filter_strength) *
+        smoothstep(0.03, 0.22, edge_confidence);
+    if (edge_blend <= 1.0e-3) {
+        return center;
+    }
+
+    const float gradient_length = max(length(edge_gradient), 1.0e-5);
+    const float2 edge_normal = edge_gradient / gradient_length;
+    const float2 edge_tangent = float2(-edge_normal.y, edge_normal.x);
+    const float2 directional_offset = edge_tangent * 0.95;
+
+    float2 unused_gradient;
+    float unused_confidence;
+    const float4 tangent_positive = load_integrated_depth_aware(
+        volume_position + directional_offset,
+        boundary_position,
+        volume_dimensions,
+        center_view_depth,
+        unused_gradient,
+        unused_confidence
+    );
+    const float4 tangent_negative = load_integrated_depth_aware(
+        volume_position - directional_offset,
+        boundary_position,
+        volume_dimensions,
+        center_view_depth,
+        unused_gradient,
+        unused_confidence
+    );
+    const float4 filtered = center * 0.5 +
+        (tangent_positive + tangent_negative) * 0.25;
+
+    return lerp(center, filtered, edge_blend);
 }
 
 [numthreads(8, 8, 1)]
@@ -133,7 +227,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID) {
     const float boundary_position =
         log(max(target_view_depth, param.near_clip) / max(param.near_clip, 1.0e-3)) / log_range
         * float(param.volume_depth);
-    const float4 fog = load_integrated_depth_aware(
+    const float4 fog = reconstruct_integrated_fog(
         volume_position,
         boundary_position,
         uint2(volume_width, volume_height),

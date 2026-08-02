@@ -9,6 +9,12 @@
 [[vk::binding(1, 0)]] Texture3D<float4> history_volume;
 [[vk::binding(2, 0)]] RWTexture3D<float4> output_volume;
 [[vk::binding(3, 0)]] RWTexture2D<float> temporal_debug_slice;
+[[vk::binding(4, 0)]] SamplerState linear_sampler;
+
+// Cache the 4x4x4 center tile. Interior neighbors come from LDS; only the six workgroup faces
+// fall back to texture loads. That reduces current-volume traffic from 448 to 160 reads per full
+// workgroup while keeping LDS at 1 KiB and avoiding a 6x6x6 cooperative halo.
+groupshared float4 group_current_medium[64];
 
 float3 world_pos_from_depth(float depth, float2 screen_uv, float4x4 clip2world) {
     const float4 clip = float4(screen_uv.x * 2.0 - 1.0, 1.0 - screen_uv.y * 2.0, depth, 1.0);
@@ -17,28 +23,10 @@ float3 world_pos_from_depth(float depth, float2 screen_uv, float4x4 clip2world) 
 }
 
 float4 load_history_trilinear(float3 coordinate, uint3 dimensions) {
-    const int3 base_coordinate = int3(floor(coordinate));
-    const float3 fraction = frac(coordinate);
-    const int3 max_coordinate = int3(dimensions) - 1;
-
-    float4 result = 0.0;
-    [unroll]
-    for (int z = 0; z < 2; ++z) {
-        [unroll]
-        for (int y = 0; y < 2; ++y) {
-            [unroll]
-            for (int x = 0; x < 2; ++x) {
-                const int3 offset = int3(x, y, z);
-                const int3 sample_coordinate = clamp(base_coordinate + offset, int3(0, 0, 0), max_coordinate);
-                const float weight =
-                    (x == 0 ? 1.0 - fraction.x : fraction.x) *
-                    (y == 0 ? 1.0 - fraction.y : fraction.y) *
-                    (z == 0 ? 1.0 - fraction.z : fraction.z);
-                result += history_volume.Load(int4(sample_coordinate, 0)) * weight;
-            }
-        }
-    }
-    return result;
+    // Texture coordinates address texel centers. One hardware trilinear sample replaces eight
+    // explicit loads and their interpolation arithmetic.
+    const float3 uvw = (coordinate + 0.5) / float3(dimensions);
+    return history_volume.SampleLevel(linear_sampler, uvw, 0.0);
 }
 
 void store_temporal_result(uint3 coordinate, float4 medium, float applied_history_weight) {
@@ -48,43 +36,69 @@ void store_temporal_result(uint3 coordinate, float4 medium, float applied_histor
     }
 }
 
+uint shared_index(uint3 coordinate) {
+    return coordinate.x + coordinate.y * 4u + coordinate.z * 16u;
+}
+
 void current_neighborhood_bounds(
-    uint3 coordinate,
+    uint3 group_thread_id,
+    uint3 dispatch_thread_id,
     uint3 dimensions,
     out float4 neighborhood_min,
     out float4 neighborhood_max
 ) {
-    neighborhood_min = current_volume.Load(int4(coordinate, 0));
+    neighborhood_min = group_current_medium[shared_index(group_thread_id)];
     neighborhood_max = neighborhood_min;
-    const int3 max_coordinate = int3(dimensions) - 1;
     static const int3 offsets[6] = {
         int3(-1, 0, 0), int3(1, 0, 0),
         int3(0, -1, 0), int3(0, 1, 0),
         int3(0, 0, -1), int3(0, 0, 1)
     };
+    const int3 max_coordinate = int3(dimensions) - 1;
     [unroll]
     for (uint sample_index = 0u; sample_index < 6u; ++sample_index) {
-        const int3 sample_coordinate = clamp(
-            int3(coordinate) + offsets[sample_index], int3(0, 0, 0), max_coordinate
+        const int3 local_coordinate = int3(group_thread_id) + offsets[sample_index];
+        const bool inside_group = all(local_coordinate >= 0) && all(local_coordinate < 4);
+        const int3 global_coordinate = clamp(
+            int3(dispatch_thread_id) + offsets[sample_index],
+            int3(0, 0, 0),
+            max_coordinate
         );
-        const float4 sample_medium = current_volume.Load(int4(sample_coordinate, 0));
+        const float4 sample_medium = inside_group
+            ? group_current_medium[shared_index(uint3(local_coordinate))]
+            : current_volume.Load(int4(global_coordinate, 0));
         neighborhood_min = min(neighborhood_min, sample_medium);
         neighborhood_max = max(neighborhood_max, sample_medium);
     }
 }
 
 [numthreads(4, 4, 4)]
-void main(uint3 dispatch_thread_id : SV_DispatchThreadID) {
+void main(
+    uint3 dispatch_thread_id : SV_DispatchThreadID,
+    uint3 group_thread_id : SV_GroupThreadID
+) {
     uint width;
     uint height;
     uint depth;
     output_volume.GetDimensions(width, height, depth);
     const uint3 dimensions = uint3(width, height, depth);
+
+    const int3 max_source_coordinate = int3(dimensions) - 1;
+    const int3 source_coordinate = clamp(
+        int3(dispatch_thread_id), int3(0, 0, 0), max_source_coordinate
+    );
+    group_current_medium[shared_index(group_thread_id)] = current_volume.Load(
+        int4(source_coordinate, 0)
+    );
+    GroupMemoryBarrierWithGroupSync();
+
     if (any(dispatch_thread_id >= dimensions)) {
         return;
     }
 
-    const float4 current_medium = current_volume.Load(int4(dispatch_thread_id, 0));
+    const float4 current_medium = group_current_medium[
+        shared_index(group_thread_id)
+    ];
     if (param.history_valid == 0 || param.history_weight <= 0.0) {
         store_temporal_result(dispatch_thread_id, current_medium, 0.0);
         return;
@@ -144,13 +158,20 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID) {
     float4 neighborhood_min;
     float4 neighborhood_max;
     current_neighborhood_bounds(
-        dispatch_thread_id, dimensions, neighborhood_min, neighborhood_max
+        group_thread_id,
+        dispatch_thread_id,
+        dimensions,
+        neighborhood_min,
+        neighborhood_max
     );
     const float4 neighborhood_range = neighborhood_max - neighborhood_min;
     const float4 clamp_margin =
         neighborhood_range * max(param.clamp_expansion, 0.0) + 1.0e-5;
+    const float4 raw_history_medium = load_history_trilinear(
+        previous_coordinate, dimensions
+    );
     const float4 history_medium = clamp(
-        load_history_trilinear(previous_coordinate, dimensions),
+        raw_history_medium,
         neighborhood_min - clamp_margin,
         neighborhood_max + clamp_margin
     );
@@ -181,11 +202,32 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID) {
     const float edge_history_weight = min(base_history_weight + 0.04, 0.98);
     const float motion_response = max(param.motion_weight_scale, 0.0) *
         lerp(1.0, 0.35, edge_confidence);
+    const float history_rejection = max(
+        max(
+            abs(raw_history_medium.r - history_medium.r) /
+                max(neighborhood_range.r, max(abs(current_medium.r) * 0.1, 1.0e-4)),
+            abs(raw_history_medium.g - history_medium.g) /
+                max(neighborhood_range.g, max(abs(current_medium.g) * 0.1, 1.0e-4))
+        ),
+        max(
+            abs(raw_history_medium.b - history_medium.b) /
+                max(neighborhood_range.b, max(abs(current_medium.b) * 0.1, 1.0e-4)),
+            abs(raw_history_medium.a - history_medium.a) /
+                max(neighborhood_range.a, max(abs(current_medium.a) * 0.1, 1.0e-4))
+        )
+    );
+    const float reactive_mask = saturate((history_rejection - 0.05) * 1.5) *
+        saturate(0.25 + length(reprojection_motion) * 0.75);
+    const float history_acceptance = lerp(
+        1.0,
+        0.20,
+        reactive_mask * saturate(param.reactive_strength)
+    );
     const float applied_history_weight = lerp(
         base_history_weight,
         edge_history_weight,
         edge_confidence
-    ) * exp(-length(reprojection_motion) * motion_response);
+    ) * exp(-length(reprojection_motion) * motion_response) * history_acceptance;
     const float4 temporal_medium = lerp(
         current_medium,
         max(history_medium, 0.0),

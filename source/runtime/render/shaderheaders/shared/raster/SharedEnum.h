@@ -16,6 +16,8 @@ EnumParam(EAoMode, NONE, SSAO, SSAO_AO_ONLY, RTAO, RTAO_AO_ONLY, SSDO, SSDO_AO_O
 EnumParam(EDenoiserMode, NONE, BILATERAL_FILTER);
 EnumParam(ERtaoSampleMode, UNIFORM, COSINE_WEIGHTED);
 EnumParam(EShadowMapMode, NONE, POINT_CUBE, CSM, CSM_AUTO);
+// Volumetric-fog density sampling. Lighting, shadow and history coordinates remain unjittered.
+EnumParam(EVolumetricFogJitterMode, OFF, HALTON, WHITE_NOISE, FAST_XY, FAST_XYZ_OFFSET);
 // Used for glTF material alpha mode (gltf..Parser.cpp)
 EnumParam(EAlphaMode, Opaque, Mask, Blend);
 EnumParam(ELightType, None, Directional, Point, Spot, Ambient, Environment);

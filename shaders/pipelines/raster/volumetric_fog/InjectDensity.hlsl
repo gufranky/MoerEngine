@@ -6,13 +6,18 @@
 BINDLESS_BINDINGS(3, 2, 4, 5)
 #include "shared/raster/ShaderParameters.h"
 #include "pipelines/raster/deferred/lighting/ProbeGI.hlsli"
+#include "pipelines/raster/volumetric_fog/VolumetricRadianceCache.hlsli"
 
 [[vk::push_constant]] ConstantBuffer<Moer::VolumetricFogInjectParam> param;
 [[vk::binding(0, 0)]] ConstantBuffer<Moer::LightingData> lighting_data;
 [[vk::binding(1, 0)]] RWTexture3D<float4> volume_texture;
-[[vk::binding(2, 0)]] RWTexture3D<float>  shadow_volume;
+[[vk::binding(2, 0)]] Texture3D<float> shadow_volume;
+[[vk::binding(3, 0)]] Texture3D<float4> fast_noise_texture;
+[[vk::binding(4, 0)]] RWTexture2D<float4> radiance_cache_debug_slice;
+[[vk::binding(5, 0)]] RWTexture2D<float4> radiance_cache_meta_slice;
 
 groupshared float3 group_probe_radiance;
+groupshared float4 group_probe_cache_meta;
 
 float3 world_pos_from_depth(float depth, float2 screen_uv, float4x4 clip2world) {
     const float4 clip = float4(screen_uv.x * 2.0 - 1.0, 1.0 - screen_uv.y * 2.0, depth, 1.0);
@@ -26,58 +31,55 @@ float henyey_greenstein(float cos_theta, float g) {
     return (1.0 - g2) / (4.0 * PI * denominator * sqrt(denominator));
 }
 
-int get_cascade_index(float3 world_position) {
-    const float view_z = abs(mul(lighting_data.world2view, float4(world_position, 1.0)).z);
-    const float depth_ratio = (view_z - lighting_data.near_clip)
-        / max(lighting_data.far_clip - lighting_data.near_clip, 1.0e-4);
-    [unroll]
-    for (int cascade_index = 0; cascade_index < 4; ++cascade_index) {
-        if (cascade_index >= int(lighting_data.shadow_csm_num_of_cascades)) {
-            break;
-        }
-        if (depth_ratio < lighting_data.cascade_split_ratios[cascade_index]) {
-            return cascade_index;
-        }
-    }
-    return -1;
+uint fog_hash(uint value) {
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    value ^= value >> 16u;
+    return value;
 }
 
-float sample_csm_visibility(float3 world_position) {
-    if (param.shadow_enabled == 0 || lighting_data.shadow_csm_num_of_cascades == 0) {
-        return 1.0;
+float hash_to_unit_float(uint value) {
+    return float(fog_hash(value) & 0x00ffffffu) * (1.0 / 16777216.0);
+}
+
+float3 sample_froxel_jitter(uint3 froxel_id) {
+    if (param.jitter_mode == Moer::EVolumetricFogJitterMode::OFF) {
+        return float3(0.0, 0.0, 0.0);
+    }
+    if (param.jitter_mode == Moer::EVolumetricFogJitterMode::HALTON) {
+        return param.jitter;
+    }
+    if (param.jitter_mode == Moer::EVolumetricFogJitterMode::WHITE_NOISE) {
+        const uint seed = fog_hash(
+            froxel_id.x + fog_hash(froxel_id.y + fog_hash(froxel_id.z + param.jitter_frame_index))
+        );
+        return float3(
+            hash_to_unit_float(seed ^ 0x68bc21ebu),
+            hash_to_unit_float(seed ^ 0x02e5be93u),
+            hash_to_unit_float(seed ^ 0x967a889bu)
+        ) - 0.5;
     }
 
-    const int cascade_index = get_cascade_index(world_position);
-    if (cascade_index < 0) {
-        return 1.0;
-    }
+    uint noise_width;
+    uint noise_height;
+    uint noise_frames;
+    fast_noise_texture.GetDimensions(noise_width, noise_height, noise_frames);
+    const uint frame = param.jitter_frame_index % max(noise_frames, 1u);
+    const uint cycle = param.jitter_frame_index / max(noise_frames, 1u);
 
-    const float4 shadow_clip = mul(
-        lighting_data.world2shadow_clip[cascade_index], float4(world_position, 1.0)
+    // FAST is optimized on a torus. Integer offsets preserve the stored sample values and the
+    // intra-frame spectrum, while extending a finite time cycle without re-hashing the samples.
+    uint2 offset = uint2(fog_hash(cycle ^ 0x9e3779b9u), fog_hash(cycle ^ 0x243f6a88u));
+    if (param.jitter_mode == Moer::EVolumetricFogJitterMode::FAST_XYZ_OFFSET) {
+        offset += uint2(froxel_id.z * 37u, froxel_id.z * 17u);
+    }
+    const uint2 coordinate = uint2(
+        (froxel_id.x + offset.x) % max(noise_width, 1u),
+        (froxel_id.y + offset.y) % max(noise_height, 1u)
     );
-    const float3 shadow_ndc = shadow_clip.xyz / shadow_clip.w;
-    const float2 shadow_uv = float2(shadow_ndc.x * 0.5 + 0.5, 1.0 - (shadow_ndc.y * 0.5 + 0.5));
-    if (any(shadow_uv < 0.0) || any(shadow_uv > 1.0) || shadow_ndc.z < 0.0 || shadow_ndc.z > 1.0) {
-        return 1.0;
-    }
-
-    const uint shadow_handle = lighting_data.cascade_shadow_map[cascade_index];
-    const float texel_size = 1.0 / max(float(lighting_data.shadow_csm_sm_size), 1.0);
-    const int radius = min(int(param.shadow_pcf_radius), 2);
-    float visibility = 0.0;
-    float sample_count = 0.0;
-    [loop]
-    for (int y = -radius; y <= radius; ++y) {
-        [loop]
-        for (int x = -radius; x <= radius; ++x) {
-            const float2 sample_uv = shadow_uv + float2(x, y) * texel_size;
-            const float occluder_depth = TextureHandle(shadow_handle).SampleLevel<float>(sample_uv, 0.0);
-            // CSM uses reversed Z: a larger stored depth is closer to the light.
-            visibility += occluder_depth > shadow_ndc.z + param.shadow_bias ? 0.0 : 1.0;
-            sample_count += 1.0;
-        }
-    }
-    return visibility / max(sample_count, 1.0);
+    return fast_noise_texture.Load(int4(coordinate, frame, 0)).rgb - 0.5;
 }
 
 float3 stable_world_position_from_froxel(uint3 froxel_id, uint3 volume_size) {
@@ -95,9 +97,30 @@ float3 stable_world_position_from_froxel(uint3 froxel_id, uint3 volume_size) {
     return param.camera_position + ray_world * ray_distance;
 }
 
-float3 sample_group_probe_radiance(float3 world_position) {
+float3 sample_group_probe_radiance(float3 world_position, out float4 cache_metadata) {
+    cache_metadata = float4(0.0, 0.0, 1.0, 0.0);
     if (param.probe_gi_direction == 0 || !ProbeGIIsEnabled(lighting_data)) {
         return float3(0.0, 0.0, 0.0);
+    }
+
+    if (param.volume_radiance_cache_enabled != 0u && param.volume_radiance_cache_buffer != 0u) {
+        const float3 direction_to_camera = normalize(param.camera_position - world_position);
+        float resident_coverage = 0.0;
+        const float3 radiance = VolumetricRadianceCacheSampleDetailed(
+            lighting_data,
+            param.volume_radiance_cache_buffer,
+            world_position,
+            direction_to_camera,
+            param.volume_radiance_cache_directionality,
+            resident_coverage
+        );
+        cache_metadata = VolumetricRadianceCacheDebugMetadata(
+            lighting_data,
+            param.volume_radiance_cache_buffer,
+            world_position,
+            resident_coverage
+        );
+        return radiance * max(param.probe_gi_intensity, 0.0);
     }
 
     // Fog has no surface normal. Rotate one tetrahedral hemispherical irradiance direction per
@@ -133,15 +156,18 @@ void main(
     const uint3 volume_size = uint3(width, height, depth);
     const bool in_bounds = all(dispatch_thread_id < volume_size);
 
-    // Probe irradiance varies far more slowly than density or CSM visibility. One lane samples
-    // the center of each 4x4x4 workgroup and broadcasts 12 bytes through group shared memory,
-    // reducing Probe GI lookup positions by 64x. Four-frame directional rotation provides a
-    // further 4x temporal amortization without adding a texture or another dispatch.
+    // World-space radiance varies far more slowly than density or CSM visibility. One lane samples
+    // the center of each 4x4x4 workgroup and broadcasts it through group shared memory. When the
+    // dedicated cache is unavailable, the legacy four-frame surface-Probe approximation remains
+    // as a controlled fallback.
     if (all(group_thread_id == uint3(0, 0, 0))) {
         const uint3 group_center = min(group_id * 4u + 2u, volume_size - 1u);
         const float3 group_world_position =
             stable_world_position_from_froxel(group_center, volume_size);
-        group_probe_radiance = sample_group_probe_radiance(group_world_position);
+        group_probe_radiance = sample_group_probe_radiance(
+            group_world_position,
+            group_probe_cache_meta
+        );
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -149,8 +175,17 @@ void main(
         return;
     }
 
+    if (dispatch_thread_id.z == min(param.volume_radiance_cache_debug_slice, volume_size.z - 1u)) {
+        radiance_cache_debug_slice[dispatch_thread_id.xy] = float4(
+            max(group_probe_radiance, 0.0),
+            group_probe_cache_meta.x
+        );
+        radiance_cache_meta_slice[dispatch_thread_id.xy] = group_probe_cache_meta;
+    }
+
+    const float3 froxel_jitter = sample_froxel_jitter(dispatch_thread_id);
     const float2 jittered_uv =
-        (float2(dispatch_thread_id.xy) + 0.5 + param.jitter.xy) / float2(width, height);
+        (float2(dispatch_thread_id.xy) + 0.5 + froxel_jitter.xy) / float2(width, height);
     const float2 stable_uv =
         (float2(dispatch_thread_id.xy) + 0.5) / float2(width, height);
 
@@ -172,7 +207,7 @@ void main(
     ).xyz;
 
     const float slice_fraction = saturate(
-        (float(dispatch_thread_id.z) + 0.5 + param.jitter.z) / float(depth)
+        (float(dispatch_thread_id.z) + 0.5 + froxel_jitter.z) / float(depth)
     );
     const float stable_slice_fraction =
         (float(dispatch_thread_id.z) + 0.5) / float(depth);
@@ -237,7 +272,9 @@ void main(
         (global_extinction * saturate(param.albedo) +
          local_extinction * saturate(param.local_volume_albedo)) * indirect_radiance;
 
-    const float visibility = sample_csm_visibility(stable_world_position);
+    // CSM visibility is evaluated and temporally resolved in a separate scalar pass. Medium
+    // injection therefore sees a stable shadow field while retaining the density jitter below.
+    const float visibility = shadow_volume.Load(int4(dispatch_thread_id, 0));
     const float cos_theta = dot(
         normalize(param.directional_light_direction), -stable_ray_world
     );
@@ -255,5 +292,4 @@ void main(
             local_emission,
         extinction
     );
-    shadow_volume[dispatch_thread_id] = visibility;
 }

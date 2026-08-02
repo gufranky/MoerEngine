@@ -7,7 +7,9 @@
 [[vk::binding(1, 0)]] Texture3D<float>    shadow_volume;
 [[vk::binding(2, 0)]] Texture3D<float4>   integrated_volume;
 [[vk::binding(3, 0)]] Texture2D<float>    temporal_debug_slice;
-[[vk::binding(4, 0)]] RWTexture2D<float4> debug_output;
+[[vk::binding(4, 0)]] Texture2D<float4>   radiance_cache_debug_slice;
+[[vk::binding(5, 0)]] Texture2D<float4>   radiance_cache_meta_slice;
+[[vk::binding(6, 0)]] RWTexture2D<float4> debug_output;
 
 float3 heatmap(float value) {
     const float x = saturate(value);
@@ -39,9 +41,21 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID) {
     const float history_weight = param.temporal_enabled != 0
         ? temporal_debug_slice.Load(int3(source_xy, 0))
         : 0.0;
+    const float4 cache_debug = radiance_cache_debug_slice.Load(int3(source_xy, 0));
+    const float4 cache_meta = radiance_cache_meta_slice.Load(int3(source_xy, 0));
 
     float3 color;
-    if (param.debug_mode == 6) {
+    if (param.debug_mode == 11) {
+        color = heatmap(1.0 - exp(-cache_meta.w * max(param.exposure, 0.0)));
+    } else if (param.debug_mode == 10) {
+        color = heatmap(cache_meta.z);
+    } else if (param.debug_mode == 9) {
+        color = heatmap(cache_meta.y);
+    } else if (param.debug_mode == 8) {
+        color = heatmap(cache_debug.a);
+    } else if (param.debug_mode == 7) {
+        color = 1.0 - exp(-max(cache_debug.rgb, 0.0) * max(param.exposure, 0.0));
+    } else if (param.debug_mode == 6) {
         color = heatmap(history_weight);
     } else if (param.debug_mode == 5) {
         color = integrated.a.xxx;

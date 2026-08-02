@@ -357,6 +357,23 @@ struct RasterConfig {
     // one tetrahedral direction per frame is reconstructed by the existing temporal filter.
     bool   volumetric_fog_probe_gi_enabled       = true;
     float  volumetric_fog_probe_gi_intensity     = 1.0f;
+    // Moer-specific world-space cache. Stage 1 shares Probe GI's adaptive sparse layout while
+    // storing a dedicated first-order directional-radiance payload per physical probe.
+    bool   volumetric_fog_radiance_cache_enabled = true;
+    float  volumetric_fog_radiance_cache_directionality = 0.35f;
+    // Medium-aware refinement and scheduling for the shared sparse Probe hierarchy. Cells with
+    // negligible extinction stay coarse; visible density transitions and local-fog boundaries
+    // request finer bricks and are refreshed before homogeneous/off-screen regions.
+    float  volumetric_fog_radiance_cache_density_threshold = 0.0010f;
+    float  volumetric_fog_radiance_cache_gradient_threshold = 0.18f;
+    float  volumetric_fog_radiance_cache_screen_weight = 1.0f;
+    float  volumetric_fog_radiance_cache_priority_weight = 2.0f;
+    // Stable low-order radiance feedback approximates higher-order scattering without tracing a
+    // full path per froxel. The update shader also attenuates transported energy through the
+    // participating medium before it enters the cache.
+    float  volumetric_fog_radiance_cache_history_weight = 0.88f;
+    float  volumetric_fog_radiance_cache_multi_scatter = 0.12f;
+    int    volumetric_fog_radiance_cache_transmittance_steps = 6;
     float  volumetric_fog_scattering_intensity  = 0.75f;
     float  volumetric_fog_max_distance          = 60.0f;
     // UE-style near-field controls keep the camera neighborhood readable instead of applying
@@ -382,7 +399,11 @@ struct RasterConfig {
     int    volumetric_fog_shadow_pcf_radius     = 1;
     float  volumetric_fog_shadow_bias           = 0.0005f;
     bool   volumetric_fog_temporal_enabled       = true;
-    bool   volumetric_fog_jitter_enabled         = true;
+    // Keep Halton as the default until FAST passes the motion, convergence and GPU-time A/B.
+    // Store the mode in the byte previously occupied by volumetric_fog_jitter_enabled. RasterConfig
+    // crosses the runtime/editor module boundary, so preserving this offset avoids stale-object ABI
+    // corruption during incremental builds. Values map to EVolumetricFogJitterMode.
+    uint8 volumetric_fog_jitter_mode = static_cast<uint8>(EVolumetricFogJitterMode::HALTON);
     // Favor stability for a world-space medium. Neighborhood clamping still rejects stale
     // history, while a gentler motion response avoids exposing stochastic CSM edges on motion.
     float  volumetric_fog_history_weight         = 0.94f;
@@ -390,6 +411,12 @@ struct RasterConfig {
     float  volumetric_fog_history_clamp_expansion = 0.10f;
     float  volumetric_fog_history_reset_distance = 2.0f;
     float  volumetric_fog_history_reset_angle    = 20.0f;
+    // Full-resolution, geometry-depth-aware reconstruction for the low-resolution froxel field.
+    // An edge-adaptive directional filter smooths volumetric silhouettes along their tangent while
+    // rejecting samples across opaque depth discontinuities. Keep this independent from temporal
+    // reprojection for clean A/B tests.
+    bool   volumetric_fog_reconstruction_filter_enabled  = true;
+    float  volumetric_fog_reconstruction_filter_strength = 0.75f;
     int    volumetric_fog_debug_mode            = 0;
     int    volumetric_fog_debug_slice           = 16;
     float  volumetric_fog_debug_exposure        = 8.0f;

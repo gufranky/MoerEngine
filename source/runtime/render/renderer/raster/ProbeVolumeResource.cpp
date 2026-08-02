@@ -46,6 +46,96 @@ float3 SafeNormalize(float3 value, float3 fallback) {
     return Normalizef(value);
 }
 
+struct FogMediumStats {
+    float density  = 0.0f;
+    float gradient = 0.0f;
+    float screen   = 0.0f;
+    float priority = 0.0f;
+    uint desired_level = RASTER_PROBE_MAX_SUBDIVISION_LEVEL;
+};
+
+float EvaluateFogMediumDensity(const RasterConfig& config, float3 world_position) {
+    const float global_exponent = Clamp(
+        -Max(config.volumetric_fog_height_falloff, 0.0f) *
+            (world_position.y - config.volumetric_fog_height_offset),
+        -16.0f,
+        16.0f
+    );
+    float density = Max(config.volumetric_fog_base_density, 0.0f) * std::exp(global_exponent);
+    if (config.volumetric_fog_local_volume_enabled &&
+        config.volumetric_fog_local_volume_radius > 1.0e-3f) {
+        const float radius = Max(config.volumetric_fog_local_volume_radius, 1.0e-3f);
+        const float radial_distance = Lengthf(world_position - config.volumetric_fog_local_volume_center) /
+                                      radius;
+        const float radial_fade = Clamp(1.0f - radial_distance, 0.0f, 1.0f);
+        const float smooth_fade = radial_fade * radial_fade * (3.0f - 2.0f * radial_fade);
+        const float local_exponent = Clamp(
+            -Max(config.volumetric_fog_local_volume_height_falloff, 0.0f) *
+                (world_position.y - config.volumetric_fog_local_volume_center.y -
+                 config.volumetric_fog_local_volume_height_offset),
+            -16.0f,
+            16.0f
+        );
+        density += Max(config.volumetric_fog_local_volume_density, 0.0f) *
+                   std::pow(smooth_fade, Max(config.volumetric_fog_local_volume_edge_falloff, 0.25f)) *
+                   std::exp(local_exponent);
+    }
+    return Min(density * Max(config.volumetric_fog_extinction_scale, 0.0f), 64.0f);
+}
+
+FogMediumStats AnalyzeFogMediumBounds(
+    const RasterConfig& config,
+    const Box3D& bounds,
+    float3 camera_position
+) {
+    FogMediumStats stats{};
+    if (!bounds.IsValid()) {
+        return stats;
+    }
+
+    const float3 center = (bounds.min + bounds.max) * 0.5f;
+    float min_density = EvaluateFogMediumDensity(config, center);
+    float max_density = min_density;
+    float density_sum = min_density;
+    for (uint corner = 0u; corner < 8u; ++corner) {
+        const float3 sample_position(
+            (corner & 1u) != 0u ? bounds.max.x : bounds.min.x,
+            (corner & 2u) != 0u ? bounds.max.y : bounds.min.y,
+            (corner & 4u) != 0u ? bounds.max.z : bounds.min.z
+        );
+        const float density = EvaluateFogMediumDensity(config, sample_position);
+        min_density = Min(min_density, density);
+        max_density = Max(max_density, density);
+        density_sum += density;
+    }
+
+    stats.density = density_sum / 9.0f;
+    stats.gradient = (max_density - min_density) / Max(max_density, 1.0e-5f);
+    const float diagonal = Lengthf(bounds.max - bounds.min);
+    const float distance = std::sqrt(Max(SquaredLengthf(center - camera_position), 1.0e-4f));
+    stats.screen = Clamp(diagonal / Max(distance * 0.35f, 1.0e-3f), 0.0f, 1.0f);
+
+    const float density_threshold = Max(
+        config.volumetric_fog_radiance_cache_density_threshold,
+        1.0e-6f
+    );
+    const float density_weight = Clamp(max_density / (density_threshold * 4.0f), 0.0f, 1.0f);
+    const float screen_weight = Clamp(config.volumetric_fog_radiance_cache_screen_weight, 0.0f, 4.0f);
+    stats.priority = density_weight *
+        (0.25f + 0.75f * Clamp(stats.screen * screen_weight, 0.0f, 1.0f)) *
+        (1.0f + stats.gradient);
+
+    if (max_density < density_threshold) {
+        stats.desired_level = RASTER_PROBE_MAX_SUBDIVISION_LEVEL;
+    } else if (stats.gradient >= Max(config.volumetric_fog_radiance_cache_gradient_threshold, 0.0f) ||
+               stats.screen >= 0.55f || max_density >= density_threshold * 8.0f) {
+        stats.desired_level = 0u;
+    } else {
+        stats.desired_level = Min(1u, RASTER_PROBE_MAX_SUBDIVISION_LEVEL);
+    }
+    return stats;
+}
+
 bool NearlyEqual(float lhs, float rhs) {
     return std::abs(lhs - rhs) <= 1e-5f;
 }
@@ -193,6 +283,20 @@ void ProbeVolumeResource::Create(RenderDevice& device, BindlessArrayRef& bdls) {
     );
     m_irradiance_atlas_buffer.hdl = bdls->AllocateBuffer(m_irradiance_atlas_buffer.buf->GetView());
 
+    constexpr uint volumetric_radiance_byte_size =
+        sizeof(VolumetricRadianceProbeData) * RASTER_PROBE_MAX_COUNT;
+    for (uint cache_index = 0u; cache_index < m_volumetric_radiance_buffers.size(); ++cache_index) {
+        m_volumetric_radiance_buffers[cache_index].buf = device.CreateBuffer<byte>(
+            std::format("Raster::ProbeVolume::VolumetricRadianceL1_{}", cache_index),
+            volumetric_radiance_byte_size,
+            EBufferUsageFlags::UNORDERED_ACCESS
+        );
+        m_volumetric_radiance_buffers[cache_index].hdl = bdls->AllocateBuffer(
+            m_volumetric_radiance_buffers[cache_index].buf->GetView()
+        );
+    }
+    m_volumetric_radiance_active_index = 0u;
+
     const ETextureUsageFlags atlas_usage = ETextureUsageFlags::SAMPLED | ETextureUsageFlags::UNORDERED_ACCESS;
     const Extent3D           atlas_size(
                   RASTER_PROBE_ATLAS_TEXTURE_WIDTH,
@@ -228,7 +332,7 @@ void ProbeVolumeResource::Create(RenderDevice& device, BindlessArrayRef& bdls) {
     m_scene_data_upload.resize(scene_data_byte_size);
 
     LOG_DEBUG(
-        "[ProbeGI] Created probe buffers: max_volumes={}, max_count={}, probe_byte_size={}, probe_handle={}, volume_desc_byte_size={}, volume_desc_handle={}, max_cells={}, cell_desc_byte_size={}, cell_desc_handle={}, max_bricks={}, brick_desc_byte_size={}, brick_desc_handle={}, max_pages={}, page_table_byte_size={}, page_table_handle={}, visibility_dim={}x{}, visibility_byte_size={}, visibility_handle={}, irradiance_dim={}x{}, irradiance_byte_size={}, irradiance_handle={}, atlas_texture={}x{}, visibility_texture_handle={}, irradiance_texture_handle={}, scene_data_byte_size={}",
+        "[ProbeGI] Created probe buffers: max_volumes={}, max_count={}, probe_byte_size={}, probe_handle={}, volume_desc_byte_size={}, volume_desc_handle={}, max_cells={}, cell_desc_byte_size={}, cell_desc_handle={}, max_bricks={}, brick_desc_byte_size={}, brick_desc_handle={}, max_pages={}, page_table_byte_size={}, page_table_handle={}, visibility_dim={}x{}, visibility_byte_size={}, visibility_handle={}, irradiance_dim={}x{}, irradiance_byte_size={}, irradiance_handle={}, volumetric_radiance_buffers=2, volumetric_radiance_byte_size_each={}, volumetric_radiance_total_byte_size={}, volumetric_radiance_handles=({}, {}), atlas_texture={}x{}, visibility_texture_handle={}, irradiance_texture_handle={}, scene_data_byte_size={}",
         RASTER_PROBE_VOLUME_MAX_COUNT,
         RASTER_PROBE_MAX_COUNT,
         buffer_byte_size,
@@ -252,6 +356,10 @@ void ProbeVolumeResource::Create(RenderDevice& device, BindlessArrayRef& bdls) {
         RASTER_PROBE_IRRADIANCE_ATLAS_DIM,
         irradiance_atlas_byte_size,
         m_irradiance_atlas_buffer.hdl,
+        volumetric_radiance_byte_size,
+        volumetric_radiance_byte_size * 2u,
+        m_volumetric_radiance_buffers[0].hdl,
+        m_volumetric_radiance_buffers[1].hdl,
         RASTER_PROBE_ATLAS_TEXTURE_WIDTH,
         RASTER_PROBE_ATLAS_TEXTURE_HEIGHT,
         m_visibility_atlas_texture.hdl,
@@ -289,6 +397,13 @@ void ProbeVolumeResource::Destroy(BindlessArrayRef& bdls) {
         bdls->UnbindBuffer(m_irradiance_atlas_buffer.hdl);
         m_irradiance_atlas_buffer.hdl = 0;
     }
+    for (BufferWithHandle& cache_buffer : m_volumetric_radiance_buffers) {
+        if (cache_buffer.hdl != 0u) {
+            bdls->UnbindBuffer(cache_buffer.hdl);
+            cache_buffer.hdl = 0u;
+        }
+        cache_buffer.buf = nullptr;
+    }
     if (m_visibility_atlas_texture.hdl != 0) {
         bdls->UnbindTexture(m_visibility_atlas_texture.hdl);
         m_visibility_atlas_texture.hdl = 0;
@@ -304,6 +419,7 @@ void ProbeVolumeResource::Destroy(BindlessArrayRef& bdls) {
     m_page_table_buffer.buf = nullptr;
     m_visibility_atlas_buffer.buf = nullptr;
     m_irradiance_atlas_buffer.buf = nullptr;
+    m_volumetric_radiance_active_index = 0u;
     m_visibility_atlas_texture.tex = nullptr;
     m_irradiance_atlas_texture.tex = nullptr;
     m_scene_data_buffer = nullptr;
@@ -675,6 +791,27 @@ ProbeVolumeResource::BuildSnapshot(const RasterConfig& config, float3 camera_pos
         static_cast<uint>(Clamp(config.probe_gi_adaptive_fine_primitives, 1, 512));
     snapshot.adaptive_transition_width = Clamp(config.probe_gi_adaptive_transition_width, 0.0f, 4.0f);
     snapshot.dirty_influence_scale = Clamp(config.probe_gi_dirty_influence_scale, 0.0f, 1.0f);
+    snapshot.volumetric_radiance_cache_enabled =
+        config.volumetric_fog_enabled && config.volumetric_fog_probe_gi_enabled &&
+        config.volumetric_fog_radiance_cache_enabled && config.probe_gi_enabled;
+    snapshot.volumetric_density_threshold = Max(
+        config.volumetric_fog_radiance_cache_density_threshold,
+        1.0e-6f
+    );
+    snapshot.volumetric_gradient_threshold = Max(
+        config.volumetric_fog_radiance_cache_gradient_threshold,
+        0.0f
+    );
+    snapshot.volumetric_screen_weight = Clamp(
+        config.volumetric_fog_radiance_cache_screen_weight,
+        0.0f,
+        4.0f
+    );
+    snapshot.volumetric_priority_weight = Clamp(
+        config.volumetric_fog_radiance_cache_priority_weight,
+        0.0f,
+        8.0f
+    );
     snapshot.geometry_generation =
         snapshot.adaptive_placement_enabled ? m_scene_geometry_generation : 0u;
     snapshot.geometry_primitive_count = snapshot.adaptive_placement_enabled ?
@@ -924,6 +1061,17 @@ ProbeVolumeResource::BuildSnapshot(const RasterConfig& config, float3 camera_pos
             const uint3  brick_last = brick_start + brick.local_counts - uint3(1u);
             const float3 brick_max = volume.origin + level_spacing * float3(brick_last);
             brick.sample_bounds = Box3D(Min(brick_min, brick_max), Max(brick_min, brick_max));
+            if (snapshot.volumetric_radiance_cache_enabled) {
+                const FogMediumStats medium_stats = AnalyzeFogMediumBounds(
+                    config,
+                    brick.sample_bounds,
+                    camera_position
+                );
+                brick.medium_density  = medium_stats.density;
+                brick.medium_gradient = medium_stats.gradient;
+                brick.medium_screen   = medium_stats.screen;
+                brick.medium_priority = medium_stats.priority;
+            }
 
             if (volume.previous_volume_index != RASTER_PROBE_PAGE_INVALID) {
                 for (uint previous_brick_index = 0u;
@@ -1033,14 +1181,14 @@ ProbeVolumeResource::BuildSnapshot(const RasterConfig& config, float3 camera_pos
                         cell_probe_counts.z > 0u ? cell_probe_counts.z - 1u : 0u
                     );
 
+                    const Box3D cell_bounds = ProbeGeometryClassifier::BuildCellInfluenceBounds(
+                        cell.origin,
+                        cell.extent,
+                        volume.spacing,
+                        volume_bounds
+                    );
                     ProbeGeometryCellStats geometry_stats{};
                     if (snapshot.adaptive_placement_enabled) {
-                        const Box3D cell_bounds = ProbeGeometryClassifier::BuildCellInfluenceBounds(
-                            cell.origin,
-                            cell.extent,
-                            volume.spacing,
-                            volume_bounds
-                        );
                         geometry_stats = ProbeGeometryClassifier::Analyze(
                             cell_bounds,
                             geometry_bounds,
@@ -1053,9 +1201,35 @@ ProbeVolumeResource::BuildSnapshot(const RasterConfig& config, float3 camera_pos
                     }
                     cell.geometry_primitive_count = geometry_stats.intersecting_primitive_count;
                     cell.occupied_voxel_count = geometry_stats.occupied_voxel_count;
-                    cell.desired_subdivision_level = Min(
+                    cell.geometry_desired_subdivision_level = Min(
                         geometry_stats.desired_subdivision_level,
                         RASTER_PROBE_MAX_SUBDIVISION_LEVEL
+                    );
+                    cell.medium_desired_subdivision_level = RASTER_PROBE_MAX_SUBDIVISION_LEVEL;
+                    if (snapshot.volumetric_radiance_cache_enabled) {
+                        const FogMediumStats medium_stats = AnalyzeFogMediumBounds(
+                            config,
+                            cell_bounds,
+                            camera_position
+                        );
+                        cell.medium_density = medium_stats.density;
+                        cell.medium_gradient = medium_stats.gradient;
+                        cell.medium_screen = medium_stats.screen;
+                        cell.medium_priority = medium_stats.priority;
+                        cell.medium_desired_subdivision_level = medium_stats.desired_level;
+                        if (medium_stats.density >= snapshot.volumetric_density_threshold) {
+                            ++snapshot.volumetric_active_cell_count;
+                        }
+                        if (medium_stats.desired_level == 0u) {
+                            ++snapshot.volumetric_fine_cell_count;
+                        }
+                    }
+                    // One physical allocation serves both surface DDGI and the volume-radiance
+                    // payload. Taking the finer requirement forms the union of their sparse
+                    // working sets without duplicating page tables or streaming state.
+                    cell.desired_subdivision_level = Min(
+                        cell.geometry_desired_subdivision_level,
+                        cell.medium_desired_subdivision_level
                     );
                     cell.geometry_generation = snapshot.geometry_generation;
                     cell.geometry_occupancy = geometry_stats.occupancy;
@@ -1802,6 +1976,13 @@ bool ProbeVolumeResource::HasSnapshotChanged(const Snapshot& snapshot) const {
         m_snapshot.fine_cell_count != snapshot.fine_cell_count ||
         m_snapshot.medium_cell_count != snapshot.medium_cell_count ||
         m_snapshot.coarse_cell_count != snapshot.coarse_cell_count ||
+        m_snapshot.volumetric_radiance_cache_enabled != snapshot.volumetric_radiance_cache_enabled ||
+        m_snapshot.volumetric_active_cell_count != snapshot.volumetric_active_cell_count ||
+        m_snapshot.volumetric_fine_cell_count != snapshot.volumetric_fine_cell_count ||
+        !NearlyEqual(m_snapshot.volumetric_density_threshold, snapshot.volumetric_density_threshold) ||
+        !NearlyEqual(m_snapshot.volumetric_gradient_threshold, snapshot.volumetric_gradient_threshold) ||
+        !NearlyEqual(m_snapshot.volumetric_screen_weight, snapshot.volumetric_screen_weight) ||
+        !NearlyEqual(m_snapshot.volumetric_priority_weight, snapshot.volumetric_priority_weight) ||
         m_snapshot.level_brick_count != snapshot.level_brick_count ||
         m_snapshot.level_requested_brick_count != snapshot.level_requested_brick_count ||
         m_snapshot.level_resident_brick_count != snapshot.level_resident_brick_count ||
@@ -1880,6 +2061,8 @@ bool ProbeVolumeResource::HasSnapshotChanged(const Snapshot& snapshot) const {
             lhs.max_subdivision_level != rhs.max_subdivision_level ||
             lhs.geometry_primitive_count != rhs.geometry_primitive_count ||
             lhs.occupied_voxel_count != rhs.occupied_voxel_count ||
+            lhs.geometry_desired_subdivision_level != rhs.geometry_desired_subdivision_level ||
+            lhs.medium_desired_subdivision_level != rhs.medium_desired_subdivision_level ||
             lhs.desired_subdivision_level != rhs.desired_subdivision_level ||
             lhs.geometry_generation != rhs.geometry_generation || !NearlyEqual(lhs.origin, rhs.origin) ||
             !NearlyEqual(lhs.extent, rhs.extent) || !NearlyEqual(lhs.min_probe_spacing, rhs.min_probe_spacing) ||
@@ -2164,6 +2347,10 @@ ProbeVolumeResource::PrepareUpdate(
         m_snapshot.geometry_generation != snapshot.geometry_generation ||
         m_snapshot.geometry_primitive_count != snapshot.geometry_primitive_count ||
         m_snapshot.cell_count != snapshot.cell_count ||
+        m_snapshot.volumetric_radiance_cache_enabled != snapshot.volumetric_radiance_cache_enabled ||
+        !NearlyEqual(m_snapshot.volumetric_density_threshold, snapshot.volumetric_density_threshold) ||
+        !NearlyEqual(m_snapshot.volumetric_gradient_threshold, snapshot.volumetric_gradient_threshold) ||
+        !NearlyEqual(m_snapshot.volumetric_screen_weight, snapshot.volumetric_screen_weight) ||
         !NearlyEqual(m_snapshot.adaptive_geometry_padding, snapshot.adaptive_geometry_padding) ||
         !NearlyEqual(m_snapshot.adaptive_fine_occupancy, snapshot.adaptive_fine_occupancy) ||
         m_snapshot.adaptive_fine_primitives != snapshot.adaptive_fine_primitives ||
@@ -2175,6 +2362,10 @@ ProbeVolumeResource::PrepareUpdate(
             if (previous.coord != current.coord || previous.volume_index != current.volume_index ||
                 previous.geometry_primitive_count != current.geometry_primitive_count ||
                 previous.occupied_voxel_count != current.occupied_voxel_count ||
+                previous.geometry_desired_subdivision_level !=
+                    current.geometry_desired_subdivision_level ||
+                previous.medium_desired_subdivision_level !=
+                    current.medium_desired_subdivision_level ||
                 previous.desired_subdivision_level != current.desired_subdivision_level ||
                 !NearlyEqual(previous.geometry_occupancy, current.geometry_occupancy)) {
                 adaptive_layout_changed = true;
@@ -2266,7 +2457,7 @@ ProbeVolumeResource::PrepareUpdate(
 
     if (adaptive_layout_changed && snapshot.adaptive_placement_enabled) {
         LOG_DEBUG(
-            "[ProbeGI] Adaptive Cell analysis updated: hierarchy={}, geometry_generation={}, world_primitive_bounds={}, cells={}, fine={}, medium={}, coarse={}, padding={}, fine_occupancy_threshold={}, fine_primitive_threshold={}, transition_width={}, requested_levels=({}, {}, {}).",
+            "[ProbeGI] Adaptive Cell analysis updated: hierarchy={}, geometry_generation={}, world_primitive_bounds={}, cells={}, fine={}, medium={}, coarse={}, volume_cache={}, medium_active={}, medium_fine={}, density_threshold={}, gradient_threshold={}, screen_weight={}, padding={}, fine_occupancy_threshold={}, fine_primitive_threshold={}, transition_width={}, requested_levels=({}, {}, {}).",
             snapshot.hierarchy_enabled ? 1 : 0,
             snapshot.geometry_generation,
             snapshot.geometry_primitive_count,
@@ -2274,6 +2465,12 @@ ProbeVolumeResource::PrepareUpdate(
             snapshot.fine_cell_count,
             snapshot.medium_cell_count,
             snapshot.coarse_cell_count,
+            snapshot.volumetric_radiance_cache_enabled ? 1 : 0,
+            snapshot.volumetric_active_cell_count,
+            snapshot.volumetric_fine_cell_count,
+            snapshot.volumetric_density_threshold,
+            snapshot.volumetric_gradient_threshold,
+            snapshot.volumetric_screen_weight,
             snapshot.adaptive_geometry_padding,
             snapshot.adaptive_fine_occupancy,
             snapshot.adaptive_fine_primitives,
@@ -2285,7 +2482,7 @@ ProbeVolumeResource::PrepareUpdate(
         for (uint cell_index = 0u; cell_index < snapshot.cell_count; ++cell_index) {
             const CellSnapshot& cell = snapshot.cells[cell_index];
             LOG_DEBUG(
-                "[ProbeGI] Adaptive Cell: index={}, volume={}, coord=({}, {}, {}), primitives={}, occupied_voxels={}/{}, occupancy={}, desired_level={}.",
+                "[ProbeGI] Adaptive Cell: index={}, volume={}, coord=({}, {}, {}), primitives={}, occupied_voxels={}/{}, occupancy={}, geometry_level={}, medium_level={}, desired_level={}, medium=(density={}, gradient={}, screen={}, priority={}).",
                 cell_index,
                 cell.volume_index,
                 cell.coord.x,
@@ -2295,7 +2492,13 @@ ProbeVolumeResource::PrepareUpdate(
                 cell.occupied_voxel_count,
                 RASTER_PROBE_OCCUPANCY_VOXEL_COUNT,
                 cell.geometry_occupancy,
-                cell.desired_subdivision_level
+                cell.geometry_desired_subdivision_level,
+                cell.medium_desired_subdivision_level,
+                cell.desired_subdivision_level,
+                cell.medium_density,
+                cell.medium_gradient,
+                cell.medium_screen,
+                cell.medium_priority
             );
         }
     }
@@ -2336,6 +2539,15 @@ ProbeVolumeResource::PrepareUpdate(
             if (lhs_dirty && lhs.subdivision_level != rhs.subdivision_level) {
                 return lhs.subdivision_level > rhs.subdivision_level;
             }
+            if (snapshot.volumetric_radiance_cache_enabled) {
+                const float lhs_urgency = float(lhs.update_age) +
+                    lhs.medium_priority * snapshot.volumetric_priority_weight * 64.0f;
+                const float rhs_urgency = float(rhs.update_age) +
+                    rhs.medium_priority * snapshot.volumetric_priority_weight * 64.0f;
+                if (!NearlyEqual(lhs_urgency, rhs_urgency)) {
+                    return lhs_urgency > rhs_urgency;
+                }
+            }
             if (lhs.update_age != rhs.update_age) {
                 return lhs.update_age > rhs.update_age;
             }
@@ -2374,6 +2586,10 @@ ProbeVolumeResource::PrepareUpdate(
         job.probe_count  = brick.probe_count;
         job.param = BuildUpdateParam(snapshot, volume, brick.volume_index, brick_index, scene, !mandatory);
         update_info.scheduled_probe_count += brick.probe_count;
+        if (snapshot.volumetric_radiance_cache_enabled && brick.medium_priority > 0.0f) {
+            ++snapshot.volumetric_scheduled_brick_count;
+            snapshot.volumetric_scheduled_priority += brick.medium_priority;
+        }
         ++update_info.scheduled_level_brick_count[brick.subdivision_level];
         next_brick_history_valid[brick_index] = true;
         m_brick_last_update_frame[brick_index] = frame_index;
@@ -2394,6 +2610,23 @@ ProbeVolumeResource::PrepareUpdate(
     m_last_scheduled_probe_count = update_info.scheduled_probe_count;
     m_last_scheduled_dirty_brick_count = update_info.scheduled_dirty_brick_count;
     m_last_deferred_dirty_brick_count = update_info.deferred_dirty_brick_count;
+
+    if (snapshot.volumetric_radiance_cache_enabled &&
+        (adaptive_layout_changed || m_frame_global_dirty_reasons != 0u)) {
+        LOG_DEBUG(
+            "[VolumetricFog][RadianceCache] Medium-aware scheduler: active_cells={}/{}, fine_cells={}, scheduled_medium_bricks={}/{}, priority_sum={:.3f}, weight={:.2f}, levels=({}, {}, {}).",
+            snapshot.volumetric_active_cell_count,
+            snapshot.cell_count,
+            snapshot.volumetric_fine_cell_count,
+            snapshot.volumetric_scheduled_brick_count,
+            update_info.job_count,
+            snapshot.volumetric_scheduled_priority,
+            snapshot.volumetric_priority_weight,
+            update_info.scheduled_level_brick_count[0],
+            update_info.scheduled_level_brick_count[1],
+            update_info.scheduled_level_brick_count[2]
+        );
+    }
 
     if (m_frame_changed_geometry_count != 0u || m_frame_global_dirty_reasons != 0u ||
         update_info.scheduled_dirty_brick_count != 0u || update_info.deferred_dirty_brick_count != 0u) {

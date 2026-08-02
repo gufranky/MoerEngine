@@ -20,6 +20,7 @@
 #include "SsrPass.h"
 #include "TonemappingPass.h"
 #include "VolumetricFogPass.h"
+#include "VolumetricFogBenchmark.h"
 #include "debug/RenderDocApi.h"
 #include "misc/ScopedLogTimer.h"
 #include "scene/testcase/SceneTestCaseDispatcher.h"
@@ -85,6 +86,7 @@ RasterRenderer::RasterRenderer(
     aa_pass                      = MakeUnique<AaPass>(raster_context);
     bloom_pass                   = MakeUnique<BloomPass>(raster_context);
     tonemapping_pass             = MakeUnique<TonemappingPass>(raster_context);
+    volumetric_fog_benchmark     = MakeUnique<VolumetricFogBenchmark>();
 
 #if WITH_CUDA
     // 固定CudaPass位于AoPass之后（需要保证AoPass必定往 ao_output 中写入数据
@@ -383,7 +385,13 @@ bool RasterRenderer::RunSingle(const SharedPtr<EditorConfig> editor_config, cons
 
         camera.Tick(editor_config);
 
-        raster_context.Update(camera.GetDeltaTime());
+        // Opt-in deterministic camera path and preset override. This runs after user input so
+        // keyboard layout, mouse capture and frame rate cannot alter benchmark poses.
+        volumetric_fog_benchmark->BeginFrame(camera, raster_config, resolution);
+
+        raster_context.Update(
+            volumetric_fog_benchmark->IsEnabled() ? (1.0f / 60.0f) : camera.GetDeltaTime()
+        );
 
         if (scene_tick_state.updated_transform) {
             raster_context.csm_data.shadow_cache_config_snapshot_valid = false;
@@ -399,7 +407,9 @@ bool RasterRenderer::RunSingle(const SharedPtr<EditorConfig> editor_config, cons
         shadow_depth_pass->Process(raster_context, raster_config, camera);
         cmd_list.PopScopeWithTimeScope();
 
-        probe_update_pass->Process(raster_context, raster_config, scene, camera, time);
+        const uint64 effect_frame_index = volumetric_fog_benchmark->GetEffectFrameIndex(time);
+        // The probe update pass also owns the adaptive sparse volumetric-radiance cache update.
+        probe_update_pass->Process(raster_context, raster_config, scene, camera, effect_frame_index);
 
         // Update Global Lighting Data
         UpdateGlobalLightingData(raster_context, raster_config, camera);
@@ -465,6 +475,10 @@ bool RasterRenderer::RunSingle(const SharedPtr<EditorConfig> editor_config, cons
         // - Tonemapping Pass
         processing_image = tonemapping_pass->Process(raster_context, raster_config, processing_image);
 
+        // Capture the final tonemapped scene before editor/UI composition. The benchmark performs
+        // a queue sync only on five explicitly selected frames per process.
+        volumetric_fog_benchmark->QueueCapture(cmd_list, processing_image.tex);
+
         if (hooks.on_ui_combine_pass) {
             default_output_texture = hooks.on_ui_combine_pass(
                 ui_combine_pass.get(),
@@ -509,7 +523,10 @@ bool RasterRenderer::RunSingle(const SharedPtr<EditorConfig> editor_config, cons
         hooks.on_render_gui(cmd_list, default_output_texture);
     }
 
-    raster_context.probe_volume.TrackFrameSubmission(cmd_list, time);
+    raster_context.probe_volume.TrackFrameSubmission(
+        cmd_list,
+        volumetric_fog_benchmark->GetEffectFrameIndex(time)
+    );
     time++;
     /***
         currently using a phony timeline (any timeline signaled by copy queue) to remove error message from validation layer caused by host synced copy operations
@@ -517,7 +534,8 @@ bool RasterRenderer::RunSingle(const SharedPtr<EditorConfig> editor_config, cons
         that we've done flushing copy queue resources
         */
     gfx_queue.Execute(cmd_list.Submit().Signal(timeline, time).DeleteResources().TickProfiling());
-    // RasterTool::TickAndLogProfiling(gfx_queue, editor_config->raster_config);
+    RasterTool::TickAndLogProfiling(gfx_queue, editor_config->raster_config);
+    volumetric_fog_benchmark->EndFrame(gfx_queue);
 
     if (!skip_present) {
         gfx_queue.Present(swapchain, default_output_texture);

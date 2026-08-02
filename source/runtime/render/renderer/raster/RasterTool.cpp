@@ -7,6 +7,7 @@
 #include "rhi/RHICommand.h"
 #include "scene/Scene.h"
 
+#include <algorithm>
 #include <cassert>
 #include <source_location>
 #include <span>
@@ -29,6 +30,18 @@ constexpr StaticArray<std::string_view, CSM_MAX_CASCADES> s_shadow_draw_scope_na
     "Raster Shadow Draw CSM3"
 };
 
+constexpr StaticArray<std::string_view, 7> s_volumetric_fog_scope_names = {
+    "Volumetric Fog Rotated Low Sample CSM",
+    "Volumetric Fog Independent Shadow History",
+    "Volumetric Fog Light And Probe GI Injection",
+    "Volumetric Fog Day6 Temporal Reprojection Clamp",
+    "Volumetric Fog Day4 Beer-Lambert Integration",
+    "Volumetric Fog Debug Visualize",
+    "Volumetric Fog Low-Resolution Reconstruction Composite"
+};
+constexpr std::string_view s_volumetric_radiance_cache_scope_name =
+    "Volumetric Fog Radiance Cache Update";
+
 constexpr std::string_view s_rt_scene_build_blas_scope_name  = "RTScene BuildBLAS";
 constexpr std::string_view s_rt_scene_build_tlas_scope_name  = "RTScene BuildTLAS";
 constexpr std::string_view s_rt_scene_update_tlas_scope_name = "RTScene UpdateTLAS";
@@ -46,6 +59,17 @@ double FindGpuTime(const ProfileData& profile_data, std::string_view name) {
         }
     }
     return -1.0;
+}
+
+std::string_view GetVolumetricFogJitterModeName(uint8 mode) {
+    switch (static_cast<EVolumetricFogJitterMode>(mode)) {
+        case EVolumetricFogJitterMode::OFF: return "off";
+        case EVolumetricFogJitterMode::HALTON: return "halton";
+        case EVolumetricFogJitterMode::WHITE_NOISE: return "white_noise";
+        case EVolumetricFogJitterMode::FAST_XY: return "fast_xy";
+        case EVolumetricFogJitterMode::FAST_XYZ_OFFSET: return "fast_xyz_offset";
+        default: return "unknown";
+    }
 }
 
 void LogRtSceneProfiling(CommandQueue& gfx_queue) {
@@ -167,6 +191,32 @@ void RasterTool::TickAndLogProfiling(CommandQueue& gfx_queue, const RasterConfig
     const double shadow_draw_sum    = sum_gpu_times(s_shadow_draw_scope_names);
     const double geometry_culling   = find_gpu_time(GetGeometryCullingProfileScopeName());
     const double geometry_draw      = find_gpu_time(GetGeometryDrawProfileScopeName());
+    const double fog_shadow_csm     = std::max(find_gpu_time(s_volumetric_fog_scope_names[0]), 0.0);
+    const double fog_shadow_temporal = std::max(find_gpu_time(s_volumetric_fog_scope_names[1]), 0.0);
+    const double fog_injection      = std::max(find_gpu_time(s_volumetric_fog_scope_names[2]), 0.0);
+    const double fog_temporal       = std::max(find_gpu_time(s_volumetric_fog_scope_names[3]), 0.0);
+    const double fog_integration    = std::max(find_gpu_time(s_volumetric_fog_scope_names[4]), 0.0);
+    const double fog_debug          = std::max(find_gpu_time(s_volumetric_fog_scope_names[5]), 0.0);
+    const double fog_composite      = std::max(find_gpu_time(s_volumetric_fog_scope_names[6]), 0.0);
+    const double fog_total          = sum_gpu_times(s_volumetric_fog_scope_names);
+    const double fog_radiance_cache_raw = find_gpu_time(s_volumetric_radiance_cache_scope_name);
+    const double fog_radiance_cache     = std::max(fog_radiance_cache_raw, 0.0);
+
+    static uint radiance_cache_scope_missing_frames = 0u;
+    if (raster_config.volumetric_fog_enabled &&
+        raster_config.volumetric_fog_radiance_cache_enabled && fog_radiance_cache_raw < 0.0) {
+        ++radiance_cache_scope_missing_frames;
+        if (radiance_cache_scope_missing_frames == 10u) {
+            std::ostringstream inventory;
+            inventory << "[RasterProfile] Radiance-cache timing scope missing for 10 frames; available GPU scopes=";
+            for (const auto& entry : profile_data.gpu_entries) {
+                inventory << "['" << entry.name << "'] ";
+            }
+            LOG_DEBUG("{}", inventory.str());
+        }
+    } else {
+        radiance_cache_scope_missing_frames = 0u;
+    }
 
     stream << "[RasterProfile] GPU(ms)";
     if (graphics_exec >= 0.0) {
@@ -184,6 +234,31 @@ void RasterTool::TickAndLogProfiling(CommandQueue& gfx_queue, const RasterConfig
     if (geometry_draw >= 0.0) {
         stream << " GeometryDraw=" << geometry_draw;
     }
+
+    stream << " FogShadowCSM=" << fog_shadow_csm
+           << " FogShadowTemporal=" << fog_shadow_temporal
+           << " FogInject=" << fog_injection
+           << " FogTemporal=" << fog_temporal
+           << " FogIntegrate=" << fog_integration
+           << " FogDebug=" << fog_debug
+           << " FogComposite=" << fog_composite
+           << " FogTotal=" << fog_total
+           << " FogRadianceCache=" << fog_radiance_cache;
+
+    stream << " | FogConfig enabled=" << (raster_config.volumetric_fog_enabled ? 1 : 0)
+           << " temporal=" << (raster_config.volumetric_fog_temporal_enabled ? 1 : 0)
+           << " jitter=" << GetVolumetricFogJitterModeName(raster_config.volumetric_fog_jitter_mode)
+           << " shadows=" << (raster_config.volumetric_fog_shadows_enabled ? 1 : 0)
+           << " pcf=" << raster_config.volumetric_fog_shadow_pcf_radius
+           << " reconstruction="
+           << (raster_config.volumetric_fog_reconstruction_filter_enabled ? 1 : 0)
+           << " reconstructionStrength="
+           << raster_config.volumetric_fog_reconstruction_filter_strength
+           << " probeGI="
+           << (raster_config.volumetric_fog_probe_gi_enabled && raster_config.probe_gi_enabled ? 1 : 0)
+           << " radianceCache="
+           << (raster_config.volumetric_fog_radiance_cache_enabled ? 1 : 0)
+           << " local=" << (raster_config.volumetric_fog_local_volume_enabled ? 1 : 0);
 
     const auto& culling_stats = raster_config.culling_stats;
     if (culling_stats.total_instances_before > 0) {

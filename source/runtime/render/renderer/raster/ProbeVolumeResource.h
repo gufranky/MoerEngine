@@ -92,6 +92,26 @@ public:
         return m_irradiance_atlas_buffer.buf->GetView();
     }
 
+    BufferView GetVolumetricRadianceBufferView() const {
+        return m_volumetric_radiance_buffers[m_volumetric_radiance_active_index].buf->GetView();
+    }
+
+    uint GetVolumetricRadianceBufferHandle() const {
+        return m_volumetric_radiance_buffers[m_volumetric_radiance_active_index].hdl;
+    }
+
+    BufferView GetVolumetricRadianceHistoryBufferView() const {
+        return m_volumetric_radiance_buffers[m_volumetric_radiance_active_index].buf->GetView();
+    }
+
+    BufferView GetVolumetricRadianceWriteBufferView() const {
+        return m_volumetric_radiance_buffers[m_volumetric_radiance_active_index ^ 1u].buf->GetView();
+    }
+
+    void SwapVolumetricRadianceBuffers() {
+        m_volumetric_radiance_active_index ^= 1u;
+    }
+
     TextureView GetVisibilityAtlasTextureView() const {
         return m_visibility_atlas_texture.tex->GetView();
     }
@@ -321,6 +341,10 @@ private:
         uint64 last_requested_frame = 0u;
         uint64 last_reused_frame = 0u;
         float camera_distance_sq = 0.0f;
+        float medium_density     = 0.0f;
+        float medium_gradient    = 0.0f;
+        float medium_screen      = 0.0f;
+        float medium_priority    = 0.0f;
     };
 
     struct VolumeSnapshot {
@@ -372,12 +396,18 @@ private:
         uint   max_subdivision_level  = 0;
         uint   geometry_primitive_count = 0;
         uint   occupied_voxel_count     = 0;
+        uint   geometry_desired_subdivision_level = RASTER_PROBE_MAX_SUBDIVISION_LEVEL;
+        uint   medium_desired_subdivision_level   = RASTER_PROBE_MAX_SUBDIVISION_LEVEL;
         uint   desired_subdivision_level = RASTER_PROBE_MAX_SUBDIVISION_LEVEL;
         uint   geometry_generation       = 0;
         float3 origin                 = float3(0.0f);
         float3 extent                 = float3(0.0f);
         float  min_probe_spacing      = 0.0f;
         float  geometry_occupancy     = 0.0f;
+        float  medium_density         = 0.0f;
+        float  medium_gradient        = 0.0f;
+        float  medium_screen          = 0.0f;
+        float  medium_priority        = 0.0f;
     };
 
     struct Snapshot {
@@ -432,6 +462,15 @@ private:
         uint   adaptive_fine_primitives   = 64u;
         float  adaptive_transition_width  = 1.5f;
         float  dirty_influence_scale      = 1.0f;
+        bool   volumetric_radiance_cache_enabled = false;
+        float  volumetric_density_threshold = 0.001f;
+        float  volumetric_gradient_threshold = 0.18f;
+        float  volumetric_screen_weight = 1.0f;
+        float  volumetric_priority_weight = 2.0f;
+        uint   volumetric_active_cell_count = 0u;
+        uint   volumetric_fine_cell_count = 0u;
+        uint   volumetric_scheduled_brick_count = 0u;
+        float  volumetric_scheduled_priority = 0.0f;
         float  brick_resident_distance    = 0.0f;
         float  brick_resident_hysteresis  = 0.0f;
         float  clipmap_anchor_hysteresis  = 0.0f;
@@ -499,6 +538,8 @@ private:
     BufferWithHandle m_page_table_buffer;
     BufferWithHandle m_visibility_atlas_buffer;
     BufferWithHandle m_irradiance_atlas_buffer;
+    StaticArray<BufferWithHandle, 2> m_volumetric_radiance_buffers;
+    uint             m_volumetric_radiance_active_index = 0u;
     TextureWithHandle m_visibility_atlas_texture;
     TextureWithHandle m_irradiance_atlas_texture;
     BufferRef        m_scene_data_buffer;

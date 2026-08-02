@@ -198,6 +198,19 @@ struct ProbeGridIrradianceTexel {
     float4 irradiance; // rgb = directional diffuse irradiance, w = confidence
 };
 
+// First-order directional radiance owned by the volumetric-lighting system. The cache shares
+// Probe GI's sparse physical-probe indices, but deliberately keeps a separate payload: surface
+// irradiance is cosine-convolved and normal indexed, while participating media needs incident
+// radiance over the sphere. Stage 1 bootstraps these coefficients from the directional Probe GI
+// atlas; later stages can update the same representation from medium-aware ray queries.
+struct VolumetricRadianceProbeData {
+    float4 l0;             // rgb = direction average, w = confidence
+    float4 l1_x;           // rgb = first-order x coefficient
+    float4 l1_y;           // rgb = first-order y coefficient
+    float4 l1_z;           // rgb = first-order z coefficient
+    float4 world_position; // xyz = source probe position, w = reserved
+};
+
 struct ProbeVolumeGpuDesc {
     float4 origin_bias;       // xyz = min corner, w = normal bias
     float4 spacing_intensity; // xyz = probe spacing, w = GI intensity
@@ -235,6 +248,19 @@ struct ProbeUpdateParam {
     uint4  probe_update_context; // x = light buffer, y = light count, z = environment cubemap, w = resident brick index
     float4 probe_ray_rotation;   // xyzw = world-space ray rotation quaternion
     float4 probe_trace_config;   // x = max ray distance, y = trace bias, z = ray count, w = ray query enabled
+};
+
+// Parameters for the participating-medium radiance cache update. Keeping the surface Probe
+// update block intact lets the two systems share sparse addressing while the volume payload has
+// its own temporal transport, extinction and multiple-scattering controls.
+struct VolumetricRadianceCacheUpdateParam {
+    ProbeUpdateParam probe;
+    float4 medium_global;       // x=density, y=height falloff, z=height offset, w=extinction scale
+    float4 medium_local_center; // xyz=center, w=radius
+    float4 medium_local_shape;  // x=density, y=edge falloff, z=height falloff, w=height offset
+    float4 medium_albedo;       // rgb=global albedo, w=approximate multiple-scattering strength
+    float4 cache_control;       // x=history weight, y=max transport distance, z=local enabled, w=ray query enabled
+    uint4  cache_dispatch;      // x=transmittance steps, y=frame index, zw=reserved
 };
 
 struct ProbeGizmoParam {
