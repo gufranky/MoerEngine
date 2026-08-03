@@ -23,7 +23,7 @@ namespace Moer::Render::Raster {
  * Opt-in, deterministic volumetric-fog visual benchmark.
  *
  * Enable with MOER_FOG_BENCHMARK_PRESET. Supported presets are:
- * off, halton, fast_xy, fast_xyz, no_shadows, probe_gi and showcase.
+ * off, mvp, halton, fast_xy, fast_xyz, no_shadows, probe_gi, showcase, highcontrast and nocoverage.
  * Each preset is intentionally run in a fresh process so temporal history and
  * stochastic sequences begin from the same state.
  */
@@ -74,7 +74,9 @@ private:
 
     Array<byte> readback_pixels;
 
-    static constexpr uint k_warmup_frames     = 120u;
+    static constexpr uint k_default_warmup_frames = 120u;
+    static constexpr uint k_warmup_frames     = k_default_warmup_frames;
+    uint   effective_warmup_frames = k_default_warmup_frames;
     static constexpr uint k_trajectory_frames = 90u;
 };
 
